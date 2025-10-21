@@ -51,7 +51,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_OUTPUT_CLIP = "agent-output.wav"
 PRESET_GREETING_CLIP = "agent-greeting.wav"
-SAFE_UNMUTE_PAD = 0.8  # seconds of extra cushion before resuming microphone
+SAFE_UNMUTE_PAD = 0.1  # seconds of extra cushion before resuming microphone
 
 
 def iso_timestamp(ts: Optional[float] = None) -> str:
@@ -393,7 +393,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     print(f"Agent audio saved to {filepath}")
                     await queue_command(f"PLAY {HTTP_BASE_URL.rstrip('/')}/{filename}")
                     playback_duration = len(audio_buffer) / (OUTPUT_SAMPLE_RATE * 2)
-                    schedule_mic_unmute(playback_duration + 0.25)
+                    schedule_mic_unmute(playback_duration)
                     audio_buffer = bytearray()
                 else:
                     if not mic_gate.is_set():
@@ -638,6 +638,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 

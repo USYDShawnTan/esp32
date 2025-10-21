@@ -392,9 +392,11 @@ void renderSpeechListeningEffect(unsigned long nowMs)
 
 void renderSpeechSpeakingEffect(unsigned long nowMs)
 {
-  // Strobing white ring to indicate active speech playback/recording.
-  bool flash = ((nowMs / 120) % 2) == 0;
-  uint32_t color = flash ? g_ledRing.Color(180, 180, 180) : g_ledRing.Color(8, 8, 8);
+  // Soft white breathing effect during active speech playback/recording.
+  float phase = (nowMs % 3000) / 3000.0f;
+  float level = 0.15f + 0.75f * (0.5f + 0.5f * sinf(phase * 2.0f * PI));
+  uint8_t intensity = static_cast<uint8_t>(fminf(level, 1.0f) * 255.0f);
+  uint32_t color = g_ledRing.Color(intensity, intensity, intensity);
   g_ledRing.fill(color, 0, LED_RING_COUNT);
 }
 
