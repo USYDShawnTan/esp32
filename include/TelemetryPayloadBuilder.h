@@ -1,0 +1,56 @@
+#pragma once
+
+#include <Arduino.h>
+
+struct TelemetryAlertEntry
+{
+  String type;
+  String detail;
+};
+
+class TelemetryPayloadBuilder
+{
+public:
+  TelemetryPayloadBuilder();
+
+  void reset();
+
+  void setFall(const String &state, float tiltDeg, float impactG);
+  void clearFall();
+
+  void setVitals(int heartRate, bool heartRateValid, int spo2, bool spo2Valid);
+  void clearVitals();
+
+  void setTemperature(float valueC, const String &status);
+  void clearTemperature();
+
+  bool addAlert(const String &type, const String &detail = String());
+
+  String build(uint64_t timestampMs = millis()) const;
+
+private:
+  static String escapeJson(const String &input);
+  static void appendKeyValue(String &json, const char *key, const String &value, bool &first);
+  static void appendKeyValue(String &json, const char *key, float value, uint8_t decimals, bool &first);
+  static void appendKeyValue(String &json, const char *key, int value, bool &first);
+  static void appendKeyValue(String &json, const char *key, uint64_t value, bool &first);
+  static void appendKeyValue(String &json, const char *key, bool value, bool &first);
+
+  bool _fallSet;
+  String _fallState;
+  float _fallTiltDeg;
+  float _fallImpact;
+
+  bool _vitalsSet;
+  int _heartRate;
+  bool _heartRateValid;
+  int _spo2;
+  bool _spo2Valid;
+
+  bool _temperatureSet;
+  float _temperatureC;
+  String _temperatureStatus;
+
+  TelemetryAlertEntry _alerts[4];
+  size_t _alertCount;
+};
