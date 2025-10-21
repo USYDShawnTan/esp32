@@ -42,6 +42,7 @@ struct PlayCommand
 static QueueHandle_t g_playQueue = nullptr;
 static WiFiClient g_micClient;
 static volatile bool g_cancelPlayback = false;
+static volatile bool g_pauseMicUpload = false;
 static TelemetryClient g_telemetryClient;
 
 static void connectWiFi();
@@ -205,6 +206,11 @@ static void micStreamTask(void *param)
     }
 
     size_t payloadBytes = samples * sizeof(int16_t);
+    if (g_pauseMicUpload)
+    {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     if (!sendFrame((uint8_t *)pcmBuffer, payloadBytes))
     {
       Serial.println("Audio server disconnected, will retry");
@@ -378,7 +384,10 @@ static void downloadAndPlayWav(const char *url)
   }
 
   g_cancelPlayback = false;
+  bool prevPauseState = g_pauseMicUpload;
+  g_pauseMicUpload = true;
   digitalWrite(SPK_SD, HIGH);
+
   uint8_t buffer[SPEAKER_DMA_LEN];
   size_t bytesWritten;
 
@@ -400,6 +409,8 @@ static void downloadAndPlayWav(const char *url)
 
   digitalWrite(SPK_SD, LOW);
   g_cancelPlayback = false;
+  vTaskDelay(pdMS_TO_TICKS(50));
+  g_pauseMicUpload = prevPauseState;
   http.end();
   Serial.println("Playback finished");
   logRemote("Playback finished");
@@ -418,5 +429,3 @@ static void logRemote(const String &message)
 {
   g_telemetryClient.postLog(message);
 }
-
-
