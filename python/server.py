@@ -35,6 +35,9 @@ from deepgram.extensions.types.sockets import (
     AgentV1UserStartedSpeakingEvent,
     AgentV1OpenAiThinkProvider,
 )
+from deepgram.extensions.types.sockets.agent_v1_update_prompt_message import (
+    AgentV1UpdatePromptMessage,
+)
 
 LISTEN_HOST = os.getenv("ESP_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("ESP_LISTEN_PORT", "9000"))
@@ -53,6 +56,12 @@ AGENT_OUTPUT_CLIP = "agent-output.wav"
 PRESET_GREETING_CLIP = "agent-greeting.wav"
 SAFE_UNMUTE_PAD = 0.05  # seconds of extra cushion before resuming microphone
 PLAYBACK_FALLBACK_EXTRA = 0.2  # additional seconds before fallback kicks in
+BASE_AGENT_PROMPT = (
+    "You are J.A.R.V.I.S., Tony Stark's trusted AI assistant. "
+    "Reply in short, natural sentences. "
+    "Keep answers to one or two sentences unless the user asks for more detail. "
+    "Be clear, confident, and avoid filler."
+)
 
 
 def iso_timestamp(ts: Optional[float] = None) -> str:
@@ -117,6 +126,113 @@ class TelemetryStore:
 
 
 telemetry_store = TelemetryStore()
+TELEMETRY_STALE_THRESHOLD = 10.0  # seconds before readings considered stale
+FALLBACK_VITALS = {
+    "temperature": 36.6,
+    "heartRate": 72,
+    "spo2": 98,
+}
+
+
+def _format_vitals_summary(vitals: Dict[str, Any]) -> str:
+    parts: list[str] = []
+    temp = vitals.get("temperature")
+    if isinstance(temp, (int, float)):
+        parts.append(f"temperature {temp:.1f} degC")
+    heart_rate = vitals.get("heartRate")
+    if isinstance(heart_rate, (int, float)):
+        hr_valid = vitals.get("heartRateValid")
+        detail = f"heart rate {int(heart_rate)} bpm"
+        if hr_valid is False:
+            detail += " (sensor flagged unreliable)"
+        parts.append(detail)
+    spo2 = vitals.get("spo2")
+    if isinstance(spo2, (int, float)):
+        spo2_valid = vitals.get("spo2Valid")
+        detail = f"SpO2 {int(spo2)}%"
+        if spo2_valid is False:
+            detail += " (sensor flagged unreliable)"
+        parts.append(detail)
+    if not parts:
+        return "No vital readings available."
+    return ", ".join(parts)
+
+
+async def build_vitals_context() -> tuple[str, bool]:
+    """Return (summary_text, is_live_data)."""
+    record = await telemetry_store.latest_any()
+    now = time.time()
+    if record:
+        age = now - record.get("timestamp", now)
+        sensors = (record.get("data") or {}).get("sensors", {})
+        temperature = sensors.get("temperature") or {}
+        vitals = sensors.get("vitals") or {}
+        merged = {
+            "temperature": temperature.get("valueC"),
+            "heartRate": vitals.get("heartRate"),
+            "heartRateValid": vitals.get("heartRateValid"),
+            "spo2": vitals.get("spo2"),
+            "spo2Valid": vitals.get("spo2Valid"),
+        }
+
+        sanitized: Dict[str, Any] = {}
+        temp_val = merged.get("temperature")
+        if isinstance(temp_val, (int, float)) and 0.0 <= temp_val <= 60.0:
+            sanitized["temperature"] = temp_val
+        heart_rate_val = merged.get("heartRate")
+        if isinstance(heart_rate_val, (int, float)) and 30 <= heart_rate_val <= 200:
+            sanitized["heartRate"] = heart_rate_val
+            sanitized["heartRateValid"] = merged.get("heartRateValid")
+        spo2_val = merged.get("spo2")
+        if isinstance(spo2_val, (int, float)) and 70 <= spo2_val <= 100:
+            sanitized["spo2"] = spo2_val
+            sanitized["spo2Valid"] = merged.get("spo2Valid")
+
+        if sanitized:
+            enriched: Dict[str, Any] = dict(FALLBACK_VITALS)
+            enriched.update({k: v for k, v in sanitized.items() if k in ("temperature", "heartRate", "spo2")})
+            if "heartRateValid" in sanitized:
+                enriched["heartRateValid"] = sanitized["heartRateValid"]
+            if "spo2Valid" in sanitized:
+                enriched["spo2Valid"] = sanitized["spo2Valid"]
+            has_live_data = True
+        else:
+            enriched = {}
+            has_live_data = False
+        if has_live_data:
+            summary = _format_vitals_summary(enriched)
+            age_text = "real-time" if age < 2 else f"updated {age:.1f}s ago"
+            return (f"Latest sensor readings ({age_text}): {summary}.", age <= TELEMETRY_STALE_THRESHOLD)
+
+    summary = _format_vitals_summary(FALLBACK_VITALS)
+    return (f"Using fallback vitals: {summary}.", False)
+
+
+def needs_vitals_context(user_text: str) -> bool:
+    lowered = user_text.lower()
+    keywords = [
+        "temperature",
+        "temp ",
+        "temp?",
+        "heart rate",
+        "heartbeat",
+        "pulse",
+        "bpm",
+        "spo2",
+        "oxygen",
+        "o2",
+        "saturation",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+async def apply_vitals_prompt(socket, summary: str, *, freshness: str) -> None:
+    prompt = (
+        f"{BASE_AGENT_PROMPT}\n\n"
+        f"Current sensor data ({freshness}): {summary}\n"
+        "If the user asks about vitals or temperature, answer using these readings explicitly."
+    )
+    await socket.send_update_prompt(AgentV1UpdatePromptMessage(prompt=prompt))
 
 
 class BridgeState:
@@ -223,12 +339,7 @@ def build_settings() -> AgentV1SettingsMessage:
             ),
             think=AgentV1Think(
                 provider=AgentV1OpenAiThinkProvider(model="gpt-4o-mini"),
-                prompt=(
-                    "You are J.A.R.V.I.S., Tony Stark's trusted AI assistant. "
-                    "Reply in short, natural sentences. "
-                    "Keep answers to one or two sentences unless the user asks for more detail. "
-                    "Be clear, confident, and avoid filler."
-                ),
+                prompt=BASE_AGENT_PROMPT,
             ),
             speak=AgentV1SpeakProviderConfig(
                 provider=AgentV1DeepgramSpeakProvider(model="aura-2-hyperion-en"),
@@ -310,6 +421,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     audio_buffer = bytearray()
     command_dispatch_task = asyncio.create_task(bridge_state.dispatch_commands(stop_event))
     pending_unmute_task: Optional[asyncio.Task] = None
+    vitals_task: Optional[asyncio.Task] = None
 
     def cancel_pending_unmute() -> None:
         nonlocal pending_unmute_task
@@ -368,6 +480,16 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     )
 
     async with client.agent.v1.connect() as socket:
+        async def vitals_prompt_loop() -> None:
+            while not stop_event.is_set():
+                summary, live = await build_vitals_context()
+                freshness = "live" if live else "fallback"
+                try:
+                    await apply_vitals_prompt(socket, summary, freshness=freshness)
+                    print(f"[Vitals] Prompt refreshed with {freshness} data: {summary}")
+                except Exception as exc:
+                    print(f"[Vitals] Failed to refresh prompt: {exc}")
+                await asyncio.sleep(10)
         async def handle_message(message) -> None:
             nonlocal audio_buffer, greeting_played
 
@@ -407,7 +529,12 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     print("Agent started speaking.")
             elif isinstance(message, AgentV1ConversationTextEvent):
                 speaker = "Assistant" if message.role == "assistant" else "User"
-                print(f"[{speaker}] {message.content}")
+                content_text = str(message.content)
+                print(f"[{speaker}] {content_text}")
+            elif getattr(message, "type", "").lower() == "history":
+                role = getattr(message, "role", "unknown")
+                content_text = str(getattr(message, "content", ""))
+                print(f"[History/{role}] {content_text}")
             elif isinstance(message, AgentV1AgentAudioDoneEvent):
                 if audio_buffer:
                     filename = AGENT_OUTPUT_CLIP
@@ -450,6 +577,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         listener_task = asyncio.create_task(socket.start_listening())
         keep_alive_task = asyncio.create_task(send_keep_alive(socket, stop_event))
         sender_task = asyncio.create_task(stream_esp_audio(reader, socket, stop_event, mic_gate))
+        vitals_task = asyncio.create_task(vitals_prompt_loop())
 
         try:
             await socket.send_settings(build_settings())
@@ -461,13 +589,16 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         finally:
             bridge_state.register_playback_finished_handler(None)
             cancel_pending_unmute()
-            for task in (sender_task, keep_alive_task, command_dispatch_task):
-                task.cancel()
+            for task in (sender_task, keep_alive_task, command_dispatch_task, vitals_task):
+                if task:
+                    task.cancel()
             stop_event.set()
             with suppress(asyncio.CancelledError):
                 await sender_task
                 await keep_alive_task
                 await command_dispatch_task
+                if vitals_task:
+                    await vitals_task
             with suppress(asyncio.CancelledError):
                 listener_task.cancel()
                 await listener_task

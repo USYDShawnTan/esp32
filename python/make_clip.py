@@ -12,7 +12,7 @@ async def main() -> None:
   load_env_files()
   api_key = os.getenv("DEEPGRAM_API_KEY")
   if not api_key:
-    raise RuntimeError("DEEPGRAM_API_KEY 未设置，无法调用 Deepgram Speak API。")
+    raise RuntimeError("Please set DEEPGRAM_API_KEY before running the Deepgram bridge.")
 
   client = AsyncDeepgramClient(api_key=api_key)
   audio_client = client.speak.v1.audio
@@ -30,7 +30,7 @@ async def main() -> None:
 
   target = DATA_DIR / CLIP_NAME
   target.write_bytes(buffer)
-  print(f"已生成 WAV 文件：{target}")
+  print(f"WAV：{target}")
 
 
 if __name__ == "__main__":

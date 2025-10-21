@@ -30,7 +30,7 @@ constexpr uint8_t LED_RING_PIN = 4;
 constexpr uint16_t LED_RING_COUNT = 16;
 
 constexpr uint32_t SENSOR_LOOP_DELAY_MS = 20;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 1000;
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 2000;
 constexpr uint32_t STATUS_PRINT_INTERVAL_MS = 5000;
 
 constexpr float FALL_IMPACT_THRESHOLD_G = 2.0f;
@@ -461,20 +461,10 @@ void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAle
   }
   case FallState::FallDetected:
   {
-    // Rapid red flash signals an active fall alert; optionally highlight tilt angle.
-    bool flash = ((nowMs / 160) % 2) == 0;
-    uint32_t color = flash ? g_ledRing.Color(255, 0, 0) : g_ledRing.Color(40, 0, 0);
-    if (fallAlertActive && !isnan(tiltDeg))
-    {
-      // Encode tilt angle on selected pixel for debugging
-      int index = static_cast<int>(fmodf(fabsf(tiltDeg), LED_RING_COUNT));
-      g_ledRing.fill(g_ledRing.Color(40, 0, 0), 0, LED_RING_COUNT);
-      g_ledRing.setPixelColor(index, g_ledRing.Color(255, 0, 0));
-    }
-    else
-    {
-      g_ledRing.fill(color, 0, LED_RING_COUNT);
-    }
+    // Bold red strobe draws immediate attention to an active fall alert.
+    bool flash = ((nowMs / 120) % 2) == 0;
+    uint32_t color = flash ? g_ledRing.Color(255, 0, 0) : g_ledRing.Color(0, 0, 0);
+    g_ledRing.fill(color, 0, LED_RING_COUNT);
     break;
   }
   }
