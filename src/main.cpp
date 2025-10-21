@@ -386,6 +386,18 @@ static void downloadAndPlayWav(const char *url)
   g_cancelPlayback = false;
   bool prevPauseState = g_pauseMicUpload;
   g_pauseMicUpload = true;
+  bool isGreetingClip = false;
+  bool appliedSpeechLed = false;
+
+  String urlStr(url);
+  urlStr.toLowerCase();
+  isGreetingClip = urlStr.endsWith("agent-greeting.wav");
+
+  if (!isGreetingClip)
+  {
+    sensorManagerTriggerSpeechSpeaking();
+    appliedSpeechLed = true;
+  }
   digitalWrite(SPK_SD, HIGH);
 
   uint8_t buffer[SPEAKER_DMA_LEN];
@@ -411,6 +423,10 @@ static void downloadAndPlayWav(const char *url)
   g_cancelPlayback = false;
   vTaskDelay(pdMS_TO_TICKS(50));
   g_pauseMicUpload = prevPauseState;
+  if (appliedSpeechLed)
+  {
+    sensorManagerClearSpeechOverride();
+  }
   http.end();
   Serial.println("Playback finished");
   logRemote("Playback finished");

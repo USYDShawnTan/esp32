@@ -10,3 +10,7 @@
  */
 void startSensorManagerTask(TelemetryClient *client);
 
+// Optional LED overrides for speech events; safe to call from other tasks.
+void sensorManagerTriggerSpeechListening();
+void sensorManagerTriggerSpeechSpeaking();
+void sensorManagerClearSpeechOverride();

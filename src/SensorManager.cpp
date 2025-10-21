@@ -2,6 +2,8 @@
 
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <Wire.h>
 
 #ifdef I2C_BUFFER_LENGTH
@@ -153,6 +155,16 @@ Adafruit_NeoPixel g_ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
 MAX30105 g_maxSensor;
 TelemetryClient *g_client = nullptr;
 
+enum class SpeechLedMode
+{
+  Idle,
+  Listening,
+  Speaking
+};
+
+portMUX_TYPE g_speechLedMux = portMUX_INITIALIZER_UNLOCKED;
+SpeechLedMode g_speechLedMode = SpeechLedMode::Idle;
+
 // Forward declarations
 bool scanMpuAddress(FallContext &ctx);
 bool writeMpuReg(uint8_t addr, uint8_t reg, uint8_t value);
@@ -165,6 +177,11 @@ float readTemperatureC(TemperatureSensorType type);
 
 const char *fallStateToString(FallState state);
 void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAlertActive);
+void renderSpeechListeningEffect(unsigned long nowMs);
+void renderSpeechSpeakingEffect(unsigned long nowMs);
+
+void setSpeechLedMode(SpeechLedMode mode);
+SpeechLedMode currentSpeechLedMode();
 
 FallReading updateFallDetector(FallContext &ctx, unsigned long nowMs);
 TemperatureReading updateTemperature(TemperatureContext &ctx, unsigned long nowMs);
@@ -182,6 +199,21 @@ void logMessage(TelemetryClient *client, const String &message)
 }
 
 } // namespace
+
+void sensorManagerTriggerSpeechListening()
+{
+  setSpeechLedMode(SpeechLedMode::Listening);
+}
+
+void sensorManagerTriggerSpeechSpeaking()
+{
+  setSpeechLedMode(SpeechLedMode::Speaking);
+}
+
+void sensorManagerClearSpeechOverride()
+{
+  setSpeechLedMode(SpeechLedMode::Idle);
+}
 
 void startSensorManagerTask(TelemetryClient *client)
 {
@@ -348,16 +380,63 @@ const char *fallStateToString(FallState state)
   }
 }
 
+// Shared LED helpers so speech-aware components can render consistent animations.
+void renderSpeechListeningEffect(unsigned long nowMs)
+{
+  // Dim white ring with a single bright pixel rotating clockwise.
+  uint32_t baseColor = g_ledRing.Color(8, 8, 8);
+  g_ledRing.fill(baseColor, 0, LED_RING_COUNT);
+  int chaseIndex = (nowMs / 120) % LED_RING_COUNT;
+  g_ledRing.setPixelColor(chaseIndex, g_ledRing.Color(180, 180, 180));
+}
+
+void renderSpeechSpeakingEffect(unsigned long nowMs)
+{
+  // Strobing white ring to indicate active speech playback/recording.
+  bool flash = ((nowMs / 120) % 2) == 0;
+  uint32_t color = flash ? g_ledRing.Color(180, 180, 180) : g_ledRing.Color(8, 8, 8);
+  g_ledRing.fill(color, 0, LED_RING_COUNT);
+}
+
+void setSpeechLedMode(SpeechLedMode mode)
+{
+  portENTER_CRITICAL(&g_speechLedMux);
+  g_speechLedMode = mode;
+  portEXIT_CRITICAL(&g_speechLedMux);
+}
+
+SpeechLedMode currentSpeechLedMode()
+{
+  portENTER_CRITICAL(&g_speechLedMux);
+  SpeechLedMode mode = g_speechLedMode;
+  portEXIT_CRITICAL(&g_speechLedMux);
+  return mode;
+}
+
 // Render the LED ring according to the current fall-detection state.
 // Each state maps to a distinctive animation so operators can gauge status at a glance.
 void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAlertActive)
 {
+  SpeechLedMode speechOverride = currentSpeechLedMode();
+  if (speechOverride == SpeechLedMode::Listening)
+  {
+    renderSpeechListeningEffect(nowMs);
+    g_ledRing.show();
+    return;
+  }
+  if (speechOverride == SpeechLedMode::Speaking)
+  {
+    renderSpeechSpeakingEffect(nowMs);
+    g_ledRing.show();
+    return;
+  }
+
   switch (state)
   {
   case FallState::Calibrating:
   {
     // Breathing blue pulse while the IMU baseline is being established.
-    float phase = (nowMs % 4000) / 4000.0f;
+    float phase = (nowMs % 8000) / 8000.0f;
     float level = 0.15f + 0.65f * (0.5f + 0.5f * sinf(phase * 2.0f * PI));
     uint8_t b = static_cast<uint8_t>(fminf(level, 1.0f) * 255.0f);
     uint32_t color = g_ledRing.Color(0, 0, b);
@@ -366,11 +445,8 @@ void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAle
   }
   case FallState::Monitoring:
   {
-    // Slow green chase indicates steady-state monitoring.
-    uint32_t baseColor = g_ledRing.Color(0, 70, 5);
-    g_ledRing.fill(baseColor, 0, LED_RING_COUNT);
-    int chaseIndex = (nowMs / 120) % LED_RING_COUNT;
-    g_ledRing.setPixelColor(chaseIndex, g_ledRing.Color(0, 255, 50));
+    // White chase indicates the system is passively listening for speech input.
+    renderSpeechListeningEffect(nowMs);
     break;
   }
   case FallState::PostImpact:
@@ -875,4 +951,3 @@ void sensorTask(void *param)
 }
 
 } // namespace
-
