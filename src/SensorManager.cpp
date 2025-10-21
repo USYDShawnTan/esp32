@@ -23,6 +23,7 @@ namespace
 constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
 
+// LED ring hardware configuration (FireBeetle's on-board NeoPixel ring).
 constexpr uint8_t LED_RING_PIN = 4;
 constexpr uint16_t LED_RING_COUNT = 16;
 
@@ -147,6 +148,7 @@ struct VitalsReading
   bool spo2Valid = false;
 };
 
+// Central LED ring instance used to convey sensor and fall-detection states.
 Adafruit_NeoPixel g_ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
 MAX30105 g_maxSensor;
 TelemetryClient *g_client = nullptr;
@@ -346,12 +348,15 @@ const char *fallStateToString(FallState state)
   }
 }
 
+// Render the LED ring according to the current fall-detection state.
+// Each state maps to a distinctive animation so operators can gauge status at a glance.
 void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAlertActive)
 {
   switch (state)
   {
   case FallState::Calibrating:
   {
+    // Breathing blue pulse while the IMU baseline is being established.
     float phase = (nowMs % 4000) / 4000.0f;
     float level = 0.15f + 0.65f * (0.5f + 0.5f * sinf(phase * 2.0f * PI));
     uint8_t b = static_cast<uint8_t>(fminf(level, 1.0f) * 255.0f);
@@ -361,6 +366,7 @@ void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAle
   }
   case FallState::Monitoring:
   {
+    // Slow green chase indicates steady-state monitoring.
     uint32_t baseColor = g_ledRing.Color(0, 70, 5);
     g_ledRing.fill(baseColor, 0, LED_RING_COUNT);
     int chaseIndex = (nowMs / 120) % LED_RING_COUNT;
@@ -369,6 +375,7 @@ void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAle
   }
   case FallState::PostImpact:
   {
+    // Amber blinking warns the system is in the post-impact cool-down window.
     bool flash = ((nowMs / 200) % 2) == 0;
     uint32_t color = flash ? g_ledRing.Color(255, 200, 0) : g_ledRing.Color(10, 10, 0);
     g_ledRing.fill(color, 0, LED_RING_COUNT);
@@ -376,6 +383,7 @@ void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAle
   }
   case FallState::FallDetected:
   {
+    // Rapid red flash signals an active fall alert; optionally highlight tilt angle.
     bool flash = ((nowMs / 160) % 2) == 0;
     uint32_t color = flash ? g_ledRing.Color(255, 0, 0) : g_ledRing.Color(40, 0, 0);
     if (fallAlertActive && !isnan(tiltDeg))
@@ -651,9 +659,9 @@ void sensorTask(void *param)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(400000); // fast mode if hardware supports it
 
-  g_ledRing.begin();
+  g_ledRing.begin();        // Prepare the NeoPixel driver before any animations run.
   g_ledRing.setBrightness(80);
-  g_ledRing.show();
+  g_ledRing.show();         // Clear residual pixels at boot.
 
   FallContext fall{};
   TemperatureContext temp{};
@@ -867,9 +875,4 @@ void sensorTask(void *param)
 }
 
 } // namespace
-
-
-
-
-
 
