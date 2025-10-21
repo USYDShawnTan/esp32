@@ -386,14 +386,14 @@ static void downloadAndPlayWav(const char *url)
   g_cancelPlayback = false;
   bool prevPauseState = g_pauseMicUpload;
   g_pauseMicUpload = true;
-  bool isGreetingClip = false;
+  bool suppressSpeechLed = false;
   bool appliedSpeechLed = false;
 
   String urlStr(url);
   urlStr.toLowerCase();
-  isGreetingClip = urlStr.endsWith("agent-greeting.wav");
+  suppressSpeechLed = urlStr.endsWith("agent-greeting.wav") || urlStr.endsWith("alert_fall_detected.wav");
 
-  if (!isGreetingClip)
+  if (!suppressSpeechLed)
   {
     sensorManagerTriggerSpeechSpeaking();
     appliedSpeechLed = true;
@@ -426,6 +426,10 @@ static void downloadAndPlayWav(const char *url)
   if (appliedSpeechLed)
   {
     sensorManagerClearSpeechOverride();
+  }
+  if (!g_telemetryClient.notifyPlaybackFinished())
+  {
+    Serial.println("[AUDIO][WARN] Failed to notify playback completion");
   }
   http.end();
   Serial.println("Playback finished");

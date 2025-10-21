@@ -23,6 +23,7 @@ public:
   bool queueAudioClip(const String &clipName) const;
   bool queueAudioUrl(const String &url) const;
   bool queueRawCommand(const String &command) const;
+  bool notifyPlaybackFinished() const;
 
 private:
   String composeUrl(const String &path) const;

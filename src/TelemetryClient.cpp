@@ -162,6 +162,16 @@ bool TelemetryClient::queueRawCommand(const String &command) const
   return postJson(composeUrl("/api/audio/play"), payload);
 }
 
+bool TelemetryClient::notifyPlaybackFinished() const
+{
+  if (!isReady())
+  {
+    Serial.println("[TEL] base URL not set, cannot notify playback finished");
+    return false;
+  }
+  return postJson(composeUrl("/api/audio/playback_done"), "{}");
+}
+
 String TelemetryClient::composeUrl(const String &path) const
 {
   if (_baseUrl.length() == 0)

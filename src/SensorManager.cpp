@@ -438,7 +438,7 @@ void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAle
   case FallState::Calibrating:
   {
     // Breathing blue pulse while the IMU baseline is being established.
-    float phase = (nowMs % 8000) / 8000.0f;
+    float phase = (nowMs % 6000) / 6000.0f;
     float level = 0.15f + 0.65f * (0.5f + 0.5f * sinf(phase * 2.0f * PI));
     uint8_t b = static_cast<uint8_t>(fminf(level, 1.0f) * 255.0f);
     uint32_t color = g_ledRing.Color(0, 0, b);

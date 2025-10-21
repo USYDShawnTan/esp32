@@ -6,7 +6,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 from aiohttp import web
 from deepgram import AsyncDeepgramClient
@@ -51,7 +51,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_OUTPUT_CLIP = "agent-output.wav"
 PRESET_GREETING_CLIP = "agent-greeting.wav"
-SAFE_UNMUTE_PAD = 0.1  # seconds of extra cushion before resuming microphone
+SAFE_UNMUTE_PAD = 0.05  # seconds of extra cushion before resuming microphone
+PLAYBACK_FALLBACK_EXTRA = 0.2  # additional seconds before fallback kicks in
 
 
 def iso_timestamp(ts: Optional[float] = None) -> str:
@@ -123,6 +124,7 @@ class BridgeState:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._command_queue: Optional[asyncio.Queue[str]] = None
         self._writer_lock = asyncio.Lock()
+        self._playback_finished_handler: Optional[Callable[[], None]] = None
         self.connected = asyncio.Event()
         self.peer: Optional[str] = None
 
@@ -137,6 +139,7 @@ class BridgeState:
         self.peer = None
         self._writer = None
         self._command_queue = None
+        self._playback_finished_handler = None
 
     async def enqueue_command(self, command: str) -> None:
         if not self._command_queue:
@@ -171,6 +174,13 @@ class BridgeState:
 
     def status(self) -> Dict[str, Any]:
         return {"connected": self.connected.is_set(), "peer": self.peer}
+
+    def register_playback_finished_handler(self, handler: Optional[Callable[[], None]]) -> None:
+        self._playback_finished_handler = handler
+
+    def notify_playback_finished(self) -> None:
+        if self._playback_finished_handler:
+            self._playback_finished_handler()
 
 
 bridge_state = BridgeState()
@@ -307,7 +317,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             pending_unmute_task.cancel()
         pending_unmute_task = None
 
-    def schedule_mic_unmute(delay: float) -> None:
+    def schedule_mic_unmute(delay: float, *, label: str | None = None) -> None:
         nonlocal pending_unmute_task
         cancel_pending_unmute()
 
@@ -316,10 +326,23 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 await asyncio.sleep(delay + SAFE_UNMUTE_PAD)
             except asyncio.CancelledError:
                 return
+            if mic_gate.is_set():
+                return
             mic_gate.set()
-            print("Microphone stream resumed after playback.")
+            if label:
+                print(f"Microphone stream resumed after playback (fallback: {label}).")
+            else:
+                print("Microphone stream resumed after playback.")
 
         pending_unmute_task = asyncio.create_task(_unmute_after_delay())
+
+    def resume_microphone_immediately(reason: str) -> None:
+        cancel_pending_unmute()
+        if not mic_gate.is_set():
+            mic_gate.set()
+            print(f"Microphone stream resumed immediately ({reason}).")
+        else:
+            print(f"Playback-finished signal received ({reason}), microphone already open.")
 
     async def queue_command(command: str) -> None:
         try:
@@ -340,6 +363,9 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         return samples / float(OUTPUT_SAMPLE_RATE)
 
     greeting_played = False
+    bridge_state.register_playback_finished_handler(
+        lambda: resume_microphone_immediately("ESP playback finished")
+    )
 
     async with client.agent.v1.connect() as socket:
         async def handle_message(message) -> None:
@@ -357,7 +383,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                         mic_gate.clear()
                         duration = estimate_wav_duration(preset_path)
                         base_delay = duration if duration > 0 else 3.0
-                        schedule_mic_unmute(base_delay)
+                        schedule_mic_unmute(base_delay, label="greeting fallback")
                         await queue_command(f"PLAY {HTTP_BASE_URL.rstrip('/')}/{PRESET_GREETING_CLIP}")
                         greeting_played = True
                     else:
@@ -393,7 +419,9 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     print(f"Agent audio saved to {filepath}")
                     await queue_command(f"PLAY {HTTP_BASE_URL.rstrip('/')}/{filename}")
                     playback_duration = len(audio_buffer) / (OUTPUT_SAMPLE_RATE * 2)
-                    schedule_mic_unmute(playback_duration)
+                    schedule_mic_unmute(
+                        playback_duration + PLAYBACK_FALLBACK_EXTRA, label="agent playback fallback"
+                    )
                     audio_buffer = bytearray()
                 else:
                     if not mic_gate.is_set():
@@ -431,6 +459,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             print("\nReceived stop signal, shutting down session...")
             stop_event.set()
         finally:
+            bridge_state.register_playback_finished_handler(None)
             cancel_pending_unmute()
             for task in (sender_task, keep_alive_task, command_dispatch_task):
                 task.cancel()
@@ -572,6 +601,14 @@ async def handle_post_audio_play(request: web.Request) -> web.Response:
     return web.json_response({"status": "queued", "command": command})
 
 
+async def handle_post_audio_playback_done(_request: web.Request) -> web.Response:
+    if not bridge_state.connected.is_set():
+        raise web.HTTPServiceUnavailable(text="ESP32 bridge is not connected.")
+    print("Playback completion notification received from ESP.")
+    bridge_state.notify_playback_finished()
+    return web.json_response({"status": "ok"})
+
+
 async def handle_get_devices(_request: web.Request) -> web.Response:
     snapshot = await telemetry_store.snapshot()
     snapshot["bridge"] = bridge_state.status()
@@ -601,6 +638,7 @@ def create_app() -> web.Application:
             web.post("/api/devices/{device_id}/telemetry", handle_post_telemetry),
             web.post("/api/devices/{device_id}/events", handle_post_event),
             web.post("/api/audio/play", handle_post_audio_play),
+            web.post("/api/audio/playback_done", handle_post_audio_playback_done),
         ]
     )
     app.router.add_static("/data/", DATA_DIR, show_index=True)
@@ -638,4 +676,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
