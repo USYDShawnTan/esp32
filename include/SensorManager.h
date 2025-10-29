@@ -13,3 +13,6 @@ void startSensorManagerTask(TelemetryClient *client);
 void sensorManagerTriggerSpeechListening();
 void sensorManagerTriggerSpeechSpeaking();
 void sensorManagerClearSpeechOverride();
+
+// Unlocks monitoring mode (exits blue calibration animation) once startup audio completes.
+void sensorManagerUnlockMonitoring();

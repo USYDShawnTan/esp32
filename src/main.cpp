@@ -8,8 +8,6 @@
 #include "TelemetryClient.h"
 
 // ===== Wi-Fi credentials =====
-// #define WIFI_SSID "Xiaomi_FC76"
-// #define WIFI_PASSWORD "67bd7ce5ba683"
 #define WIFI_SSID "TZH"
 #define WIFI_PASSWORD "123456789hhh"
 
@@ -415,7 +413,8 @@ static void downloadAndPlayWav(const char *url)
 
   String urlStr(url);
   urlStr.toLowerCase();
-  suppressSpeechLed = urlStr.endsWith("agent-greeting.wav") || urlStr.endsWith("alert_fall_detected.wav");
+  bool isGreeting = urlStr.endsWith("agent-greeting.wav");
+  suppressSpeechLed = urlStr.endsWith("alert_fall_detected.wav");
 
   if (!suppressSpeechLed)
   {
@@ -430,6 +429,7 @@ static void downloadAndPlayWav(const char *url)
   const bool sizeKnown = remaining > 0;
   uint32_t totalBytes = 0;
   uint32_t playbackStartMs = millis();
+  bool playbackCompleted = true;
 
   while (stream->connected())
   {
@@ -449,11 +449,16 @@ static void downloadAndPlayWav(const char *url)
     int len = stream->readBytes(buffer, toRead);
     if (len <= 0)
     {
+      if (len < 0)
+      {
+        playbackCompleted = false;
+      }
       break;
     }
     if (g_cancelPlayback)
     {
       Serial.println("Playback cancelled");
+      playbackCompleted = false;
       break;
     }
     i2s_write(I2S_SPK_PORT, buffer, len, &bytesWritten, portMAX_DELAY);
@@ -483,4 +488,9 @@ static void downloadAndPlayWav(const char *url)
                 expectedMs);
   http.end();
   Serial.println("Playback finished");
+
+  if (isGreeting && playbackCompleted)
+  {
+    sensorManagerUnlockMonitoring();
+  }
 }
