@@ -5,7 +5,7 @@ import sys
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from aiohttp import web
 from deepgram import AsyncDeepgramClient
@@ -64,6 +64,7 @@ class BridgeState:
         self._command_queue: Optional[asyncio.Queue[str]] = None
         self._writer_lock = asyncio.Lock()
         self._playback_finished_handler: Optional[Callable[[], None]] = None
+        self._manual_listening_callback: Optional[Callable[[bool, str], Awaitable[None]]] = None
         self.connected = asyncio.Event()
         self.peer: Optional[str] = None
         self._last_enqueued_monotonic: Optional[float] = None
@@ -82,6 +83,7 @@ class BridgeState:
         self._writer = None
         self._command_queue = None
         self._playback_finished_handler = None
+        self._manual_listening_callback = None
 
     async def enqueue_command(self, command: str) -> None:
         if not self._command_queue:
@@ -133,6 +135,16 @@ class BridgeState:
     def notify_playback_finished(self) -> None:
         if self._playback_finished_handler:
             self._playback_finished_handler()
+
+    def register_manual_listening_callback(
+        self, callback: Optional[Callable[[bool, str], Awaitable[None]]]
+    ) -> None:
+        self._manual_listening_callback = callback
+
+    async def apply_manual_listening(self, active: bool, source: str) -> None:
+        if not self._manual_listening_callback:
+            raise RuntimeError("Manual listening control is not available.")
+        await self._manual_listening_callback(active, source)
 
 
 bridge_state = BridgeState()
@@ -257,6 +269,8 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     audio_buffer = bytearray()
     command_dispatch_task = asyncio.create_task(bridge_state.dispatch_commands(stop_event))
     pending_unmute_task: Optional[asyncio.Task] = None
+    manual_listen_required = False
+    greeting_in_progress = False
 
     def cancel_pending_unmute() -> None:
         nonlocal pending_unmute_task
@@ -265,7 +279,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         pending_unmute_task = None
 
     def schedule_mic_unmute(delay: float, *, label: str | None = None) -> None:
-        nonlocal pending_unmute_task
+        nonlocal pending_unmute_task, manual_listen_required
         cancel_pending_unmute()
 
         async def _unmute_after_delay() -> None:
@@ -274,6 +288,14 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             except asyncio.CancelledError:
                 return
             if mic_gate.is_set():
+                return
+            if manual_listen_required:
+                if label:
+                    print(
+                        f"Microphone resume skipped ({label}); waiting for manual SPEECH LISTENING trigger."
+                    )
+                else:
+                    print("Microphone resume skipped; waiting for manual SPEECH LISTENING trigger.")
                 return
             mic_gate.set()
             if label:
@@ -284,7 +306,11 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         pending_unmute_task = asyncio.create_task(_unmute_after_delay())
 
     def resume_microphone_immediately(reason: str) -> None:
+        nonlocal manual_listen_required
         cancel_pending_unmute()
+        if manual_listen_required:
+            print(f"{reason}; microphone remains muted until SPEECH LISTENING trigger.")
+            return
         if not mic_gate.is_set():
             mic_gate.set()
             print(f"Microphone stream resumed immediately ({reason}).")
@@ -309,14 +335,40 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         samples = payload // 2  # 16-bit mono
         return samples / float(OUTPUT_SAMPLE_RATE)
 
+    async def apply_manual_listening(active: bool, source: str) -> None:
+        nonlocal manual_listen_required, greeting_in_progress
+        if active:
+            manual_listen_required = False
+            greeting_in_progress = False
+            if not mic_gate.is_set():
+                mic_gate.set()
+                print(f"Microphone listening enabled manually ({source}).")
+            else:
+                print(f"Manual listening enable received ({source}); microphone already active.")
+        else:
+            manual_listen_required = True
+            cancel_pending_unmute()
+            if mic_gate.is_set():
+                mic_gate.clear()
+                print(f"Microphone muted manually ({source}).")
+            else:
+                print(f"Manual listening disable received ({source}); microphone already muted.")
+
     greeting_played = False
-    bridge_state.register_playback_finished_handler(
-        lambda: resume_microphone_immediately("ESP playback finished")
-    )
+    def handle_esp_playback_finished() -> None:
+        nonlocal greeting_in_progress
+        if greeting_in_progress:
+            greeting_in_progress = False
+            print("Greeting playback finished; awaiting SPEECH LISTENING trigger.")
+            return
+        resume_microphone_immediately("ESP playback finished")
+
+    bridge_state.register_playback_finished_handler(handle_esp_playback_finished)
+    bridge_state.register_manual_listening_callback(apply_manual_listening)
 
     async with client.agent.v1.connect() as socket:
         async def handle_message(message) -> None:
-            nonlocal audio_buffer, greeting_played
+            nonlocal audio_buffer, greeting_played, manual_listen_required, greeting_in_progress
 
             if isinstance(message, bytes):
                 audio_buffer.extend(message)
@@ -327,10 +379,14 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 if not greeting_played:
                     preset_path = DATA_DIR / PRESET_GREETING_CLIP
                     if preset_path.is_file():
-                        mic_gate.clear()
-                        duration = estimate_wav_duration(preset_path)
-                        base_delay = duration if duration > 0 else 3.0
-                        schedule_mic_unmute(base_delay, label="greeting fallback")
+                        manual_listen_required = True
+                        greeting_in_progress = True
+                        cancel_pending_unmute()
+                        if mic_gate.is_set():
+                            mic_gate.clear()
+                        print(
+                            "Preset greeting playback queued; microphone muted until SPEECH LISTENING trigger."
+                        )
                         await queue_command(f"PLAY {HTTP_BASE_URL.rstrip('/')}/{PRESET_GREETING_CLIP}")
                         greeting_played = True
                     else:
@@ -339,7 +395,11 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 print("Agent is thinking...")
             elif isinstance(message, AgentV1UserStartedSpeakingEvent):
                 cancel_pending_unmute()
-                if not mic_gate.is_set():
+                if manual_listen_required:
+                    print(
+                        "User started speaking event received, but microphone locked until SPEECH LISTENING trigger."
+                    )
+                elif not mic_gate.is_set():
                     mic_gate.set()
                     print("User started speaking. Microphone stream resumed.")
                 else:
@@ -374,12 +434,21 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                         f"(payload {len(audio_buffer)} bytes, ~{duration:.2f}s)"
                     )
                     await queue_command(f"PLAY {HTTP_BASE_URL.rstrip('/')}/{filename}")
-                    schedule_mic_unmute(
-                        duration + PLAYBACK_FALLBACK_EXTRA, label="agent playback fallback"
-                    )
+                    if manual_listen_required:
+                        print(
+                            "Agent playback finished; microphone remains muted until SPEECH LISTENING trigger."
+                        )
+                    else:
+                        schedule_mic_unmute(
+                            duration + PLAYBACK_FALLBACK_EXTRA, label="agent playback fallback"
+                        )
                     audio_buffer = bytearray()
                 else:
-                    if not mic_gate.is_set():
+                    if manual_listen_required:
+                        print(
+                            "Agent audio reported done without payload; microphone remains muted until SPEECH LISTENING trigger."
+                        )
+                    elif not mic_gate.is_set():
                         mic_gate.set()
                         print("Agent audio done without payload. Microphone stream resumed.")
             elif isinstance(message, AgentV1WarningEvent):
@@ -415,6 +484,7 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             stop_event.set()
         finally:
             bridge_state.register_playback_finished_handler(None)
+            bridge_state.register_manual_listening_callback(None)
             cancel_pending_unmute()
             for task in (sender_task, keep_alive_task, command_dispatch_task):
                 if task:
@@ -544,6 +614,41 @@ async def handle_post_audio_playback_done(_request: web.Request) -> web.Response
     return web.json_response({"status": "ok"})
 
 
+async def handle_post_mic_listen(request: web.Request) -> web.Response:
+    if not bridge_state.connected.is_set():
+        raise web.HTTPServiceUnavailable(text="ESP32 bridge is not connected.")
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise web.HTTPBadRequest(text="Invalid JSON payload.")
+
+    if "active" not in payload:
+        raise web.HTTPBadRequest(text="Payload must include 'active' (boolean).")
+
+    active_val = payload["active"]
+    if isinstance(active_val, bool):
+        active = active_val
+    elif isinstance(active_val, (int, float)) and active_val in (0, 1):
+        active = bool(active_val)
+    elif isinstance(active_val, str):
+        lowered = active_val.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            active = True
+        elif lowered in {"false", "0", "no", "off"}:
+            active = False
+        else:
+            raise web.HTTPBadRequest(text="Cannot interpret 'active' value.")
+    else:
+        raise web.HTTPBadRequest(text="'active' must be a boolean.")
+
+    try:
+        await bridge_state.apply_manual_listening(active, "api/mic/listen")
+    except RuntimeError as err:
+        raise web.HTTPServiceUnavailable(text=str(err)) from err
+
+    return web.json_response({"status": "ok", "active": active})
+
+
 async def handle_root(_request: web.Request) -> web.StreamResponse:
     return web.Response(
         text=(
@@ -561,6 +666,7 @@ def create_app() -> web.Application:
             web.get("/", handle_root),
             web.post("/api/audio/play", handle_post_audio_play),
             web.post("/api/audio/playback_done", handle_post_audio_playback_done),
+            web.post("/api/mic/listen", handle_post_mic_listen),
         ]
     )
     app.router.add_static("/data/", DATA_DIR, show_index=True)

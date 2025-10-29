@@ -18,6 +18,7 @@ public:
   bool queueAudioClip(const String &clipName) const;
   bool queueAudioUrl(const String &url) const;
   bool notifyPlaybackFinished() const;
+  bool setListeningActive(bool active) const;
 
 private:
   String composeUrl(const String &path) const;

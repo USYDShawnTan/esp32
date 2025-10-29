@@ -84,6 +84,19 @@ bool TelemetryClient::notifyPlaybackFinished() const
   return postJson(composeUrl("/api/audio/playback_done"), "{}");
 }
 
+bool TelemetryClient::setListeningActive(bool active) const
+{
+  if (!isReady())
+  {
+    Serial.println("[TEL] base URL not set, cannot update listening state");
+    return false;
+  }
+  String payload = "{\"active\":";
+  payload += active ? "true" : "false";
+  payload += "}";
+  return postJson(composeUrl("/api/mic/listen"), payload);
+}
+
 String TelemetryClient::composeUrl(const String &path) const
 {
   if (_baseUrl.length() == 0)

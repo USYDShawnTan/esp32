@@ -7,6 +7,7 @@
 #include <math.h>
 
 #include "LedController.h"
+#include "TelemetryClient.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -108,11 +109,31 @@ namespace
   void renderSpeechSpeaking(unsigned long nowMs);
 
   void sensorTask(void *param);
+
+  TelemetryClient *g_telemetryClient = nullptr;
+  bool g_lastReportedListening = false;
+
+  void notifyListeningState(bool active)
+  {
+    if (!g_telemetryClient || !g_telemetryClient->isReady())
+    {
+      return;
+    }
+    if (g_lastReportedListening == active)
+    {
+      return;
+    }
+    if (g_telemetryClient->setListeningActive(active))
+    {
+      g_lastReportedListening = active;
+    }
+  }
 } // namespace
 
 void startSensorManagerTask(TelemetryClient *client)
 {
-  (void)client;
+  g_telemetryClient = client;
+  g_lastReportedListening = false;
   xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, nullptr, 1, nullptr, 1);
 }
 
@@ -520,6 +541,8 @@ namespace
     MotionContext ctx{};
     ctx.present = scanMpuAddress(ctx);
 
+    notifyListeningState(false);
+
     if (ctx.present)
     {
       writeMpuReg(ctx.mpuAddr, 0x6B, 0x01); // wake
@@ -537,11 +560,26 @@ namespace
     for (;;)
     {
       const unsigned long nowMs = millis();
+      const bool previouslyInHand = ctx.inHand;
       if (ctx.present)
       {
         updateMotion(ctx, nowMs);
       }
       updateState(ctx, nowMs);
+      if (!previouslyInHand && ctx.inHand)
+      {
+        sensorManagerTriggerSpeechListening();
+        notifyListeningState(true);
+      }
+      else if (previouslyInHand && !ctx.inHand)
+      {
+        sensorManagerClearSpeechOverride();
+        notifyListeningState(false);
+      }
+      else if (ctx.inHand && ledControllerCurrentSpeechMode() == SpeechLedMode::None)
+      {
+        sensorManagerTriggerSpeechListening();
+      }
       renderState(ctx, nowMs);
       vTaskDelay(pdMS_TO_TICKS(MOTION_LOOP_DELAY_MS));
     }
