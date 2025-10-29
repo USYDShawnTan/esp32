@@ -378,7 +378,9 @@ static void downloadAndPlayWav(const char *url)
   }
 
   Serial.printf("Downloading WAV: %s\n", url);
+  uint32_t downloadStartMs = millis();
   HTTPClient http;
+  http.setTimeout(1000);
   if (!http.begin(url))
   {
     Serial.println("HTTP begin failed");
@@ -386,6 +388,10 @@ static void downloadAndPlayWav(const char *url)
   }
 
   int code = http.GET();
+  uint32_t httpGetMs = millis() - downloadStartMs;
+  Serial.printf("[AUDIO] HTTP GET finished in %lu ms (code %d)\n",
+                static_cast<unsigned long>(httpGetMs),
+                code);
   if (code != HTTP_CODE_OK)
   {
     Serial.printf("HTTP error: %d\n", code);
@@ -420,10 +426,27 @@ static void downloadAndPlayWav(const char *url)
 
   uint8_t buffer[SPEAKER_DMA_LEN];
   size_t bytesWritten;
+  int32_t remaining = http.getSize();
+  const bool sizeKnown = remaining > 0;
+  uint32_t totalBytes = 0;
+  uint32_t playbackStartMs = millis();
 
   while (stream->connected())
   {
-    int len = stream->readBytes(buffer, sizeof(buffer));
+    size_t toRead = sizeof(buffer);
+    if (sizeKnown)
+    {
+      if (remaining <= 0)
+      {
+        break;
+      }
+      if (remaining < static_cast<int32_t>(toRead))
+      {
+        toRead = static_cast<size_t>(remaining);
+      }
+    }
+
+    int len = stream->readBytes(buffer, toRead);
     if (len <= 0)
     {
       break;
@@ -434,6 +457,11 @@ static void downloadAndPlayWav(const char *url)
       break;
     }
     i2s_write(I2S_SPK_PORT, buffer, len, &bytesWritten, portMAX_DELAY);
+    if (sizeKnown)
+    {
+      remaining -= len;
+    }
+    totalBytes += len;
   }
 
   digitalWrite(SPK_SD, LOW);
@@ -447,6 +475,12 @@ static void downloadAndPlayWav(const char *url)
   {
     Serial.println("[AUDIO][WARN] Failed to notify playback completion");
   }
+  uint32_t playbackElapsedMs = millis() - playbackStartMs;
+  float expectedMs = (static_cast<float>(totalBytes) / 2.0f / SPEAKER_SAMPLE_RATE) * 1000.0f;
+  Serial.printf("[AUDIO] Playback loop finished: %lu bytes, elapsed %lu ms, expected %.0f ms\n",
+                static_cast<unsigned long>(totalBytes),
+                static_cast<unsigned long>(playbackElapsedMs),
+                expectedMs);
   http.end();
   Serial.println("Playback finished");
 }

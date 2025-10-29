@@ -77,6 +77,9 @@ class BridgeState:
         self._playback_finished_handler: Optional[Callable[[], None]] = None
         self.connected = asyncio.Event()
         self.peer: Optional[str] = None
+        self._last_enqueued_monotonic: Optional[float] = None
+        self._last_sent_monotonic: Optional[float] = None
+        self._last_command: Optional[str] = None
 
     async def attach(self, writer: asyncio.StreamWriter, peer: Optional[str]) -> None:
         self._writer = writer
@@ -94,7 +97,11 @@ class BridgeState:
     async def enqueue_command(self, command: str) -> None:
         if not self._command_queue:
             raise RuntimeError("ESP32 bridge is not connected.")
-        await self._command_queue.put(command.strip())
+        command = command.strip()
+        await self._command_queue.put(command)
+        self._last_enqueued_monotonic = time.monotonic()
+        self._last_command = command
+        print(f"[Bridge] Command queued: {command}")
 
     async def dispatch_commands(self, stop_event: asyncio.Event) -> None:
         if not self._command_queue:
@@ -116,6 +123,15 @@ class BridgeState:
                         await writer.drain()
                     except ConnectionResetError as exc:
                         raise RuntimeError(f"ESP command dispatch failed: {exc}") from exc
+                now = time.monotonic()
+                elapsed = None
+                if self._last_enqueued_monotonic is not None:
+                    elapsed = now - self._last_enqueued_monotonic
+                self._last_sent_monotonic = now
+                if elapsed is None:
+                    print(f"[Bridge] Command sent to ESP: {command}")
+                else:
+                    print(f"[Bridge] Command sent to ESP: {command} (dispatch delay {elapsed:.3f}s)")
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -366,11 +382,14 @@ async def run_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     with filepath.open("wb") as f:
                         f.write(header)
                         f.write(audio_buffer)
-                    print(f"Agent audio saved to {filepath}")
+                    duration = len(audio_buffer) / (OUTPUT_SAMPLE_RATE * 2)
+                    print(
+                        f"Agent audio saved to {filepath} "
+                        f"(payload {len(audio_buffer)} bytes, ~{duration:.2f}s)"
+                    )
                     await queue_command(f"PLAY {HTTP_BASE_URL.rstrip('/')}/{filename}")
-                    playback_duration = len(audio_buffer) / (OUTPUT_SAMPLE_RATE * 2)
                     schedule_mic_unmute(
-                        playback_duration + PLAYBACK_FALLBACK_EXTRA, label="agent playback fallback"
+                        duration + PLAYBACK_FALLBACK_EXTRA, label="agent playback fallback"
                     )
                     audio_buffer = bytearray()
                 else:
@@ -524,7 +543,17 @@ async def handle_post_audio_play(request: web.Request) -> web.Response:
 async def handle_post_audio_playback_done(_request: web.Request) -> web.Response:
     if not bridge_state.connected.is_set():
         raise web.HTTPServiceUnavailable(text="ESP32 bridge is not connected.")
-    print("Playback completion notification received from ESP.")
+    now = time.monotonic()
+    elapsed_from_send = None
+    if bridge_state._last_sent_monotonic is not None:
+        elapsed_from_send = now - bridge_state._last_sent_monotonic
+    if elapsed_from_send is None:
+        print("Playback completion notification received from ESP.")
+    else:
+        print(
+            f"Playback completion notification received from ESP "
+            f"(elapsed {elapsed_from_send:.3f}s since last command)."
+        )
     bridge_state.notify_playback_finished()
     return web.json_response({"status": "ok"})
 
