@@ -23,6 +23,7 @@
 #define SPK_SD 15
 #define SPEAKER_SAMPLE_RATE 24000
 #define SPEAKER_DMA_LEN 512
+#define SPEAKER_PLAYBACK_GAIN 1.25f
 
 // ===== Microphone (INMP441) configuration =====
 #define I2S_MIC_PORT I2S_NUM_1
@@ -460,6 +461,25 @@ static void downloadAndPlayWav(const char *url)
       Serial.println("Playback cancelled");
       playbackCompleted = false;
       break;
+    }
+
+    if (SPEAKER_PLAYBACK_GAIN > 1.001f)
+    {
+      for (int i = 0; i + 1 < len; i += 2)
+      {
+        int16_t sample = static_cast<int16_t>(buffer[i] | (buffer[i + 1] << 8));
+        int32_t scaled = static_cast<int32_t>(sample * SPEAKER_PLAYBACK_GAIN);
+        if (scaled > 32767)
+        {
+          scaled = 32767;
+        }
+        else if (scaled < -32768)
+        {
+          scaled = -32768;
+        }
+        buffer[i] = static_cast<uint8_t>(scaled & 0xFF);
+        buffer[i + 1] = static_cast<uint8_t>((scaled >> 8) & 0xFF);
+      }
     }
     i2s_write(I2S_SPK_PORT, buffer, len, &bytesWritten, portMAX_DELAY);
     if (sizeKnown)
