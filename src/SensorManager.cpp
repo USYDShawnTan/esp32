@@ -498,6 +498,12 @@ namespace
 
   void renderState(const MotionContext &ctx, unsigned long nowMs)
   {
+    if (ctx.state == SystemState::Overload)
+    {
+      ledControllerRenderScene(LedScene::Overload, nowMs);
+      return;
+    }
+
     SpeechLedMode speechMode = ledControllerCurrentSpeechMode();
     if (speechMode == SpeechLedMode::Speaking)
     {
@@ -575,10 +581,6 @@ namespace
       {
         sensorManagerClearSpeechOverride();
         notifyListeningState(false);
-      }
-      else if (ctx.inHand && ledControllerCurrentSpeechMode() == SpeechLedMode::None)
-      {
-        sensorManagerTriggerSpeechListening();
       }
       renderState(ctx, nowMs);
       vTaskDelay(pdMS_TO_TICKS(MOTION_LOOP_DELAY_MS));
