@@ -4,9 +4,8 @@ import os
 import sys
 import time
 from contextlib import suppress
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Callable
+from typing import Callable, Optional
 
 from aiohttp import web
 from deepgram import AsyncDeepgramClient
@@ -57,16 +56,6 @@ BASE_AGENT_PROMPT = (
     "Keep answers to one or two sentences unless the user asks for more detail. "
     "Be clear, confident, and avoid filler."
 )
-
-
-def iso_timestamp(ts: Optional[float] = None) -> str:
-    if ts is None:
-        ts = time.time()
-    return (
-        datetime.fromtimestamp(ts, tz=timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
 
 
 class BridgeState:
@@ -137,9 +126,6 @@ class BridgeState:
         except Exception as exc:
             print(f"Command dispatcher stopped: {exc}")
             stop_event.set()
-
-    def status(self) -> Dict[str, Any]:
-        return {"connected": self.connected.is_set(), "peer": self.peer}
 
     def register_playback_finished_handler(self, handler: Optional[Callable[[], None]]) -> None:
         self._playback_finished_handler = handler
