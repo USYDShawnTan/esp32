@@ -54,8 +54,6 @@ static bool writeAll(WiFiClient &client, const uint8_t *data, size_t len);
 static bool sendFrame(const uint8_t *data, size_t len);
 static void enqueuePlay(const String &url);
 static void downloadAndPlayWav(const char *url);
-static void logRemote(const char *message);
-static void logRemote(const String &message);
 
 class MicUploadPauseGuard
 {
@@ -113,7 +111,6 @@ void setup()
 
   g_telemetryClient.setBaseUrl(TELEMETRY_BASE_URL);
   g_telemetryClient.setDeviceId(TELEMETRY_DEVICE_ID);
-  logRemote(String("Telemetry target: ") + TELEMETRY_BASE_URL);
 
   startSensorManagerTask(&g_telemetryClient);
 
@@ -148,7 +145,6 @@ static void connectWiFi()
   Serial.println("\nWiFi connected");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
-  logRemote(String("WiFi Connected: ") + WiFi.localIP().toString());
 }
 
 static void initSpeaker()
@@ -305,11 +301,9 @@ static bool ensureServerConnection()
   }
 
   Serial.printf("Connecting to audio bridge at %s:%d...\n", MIC_SERVER_HOST, MIC_SERVER_PORT);
-  logRemote(String("Connecting to audio bridge at ") + MIC_SERVER_HOST + ":" + String(MIC_SERVER_PORT));
   if (!g_micClient.connect(MIC_SERVER_HOST, MIC_SERVER_PORT))
   {
     Serial.println("Connection failed");
-    logRemote("Audio bridge connection failed");
     return false;
   }
 
@@ -318,7 +312,6 @@ static bool ensureServerConnection()
   snprintf(header, sizeof(header), "PCM %d 16 1\n", MIC_SAMPLE_RATE);
   g_micClient.print(header);
   Serial.println("Audio server connected");
-  logRemote("Audio server connected");
   return true;
 }
 
@@ -357,7 +350,6 @@ static bool sendFrame(const uint8_t *data, size_t len)
 
   if (!writeAll(g_micClient, header, sizeof(header)))
   {
-    logRemote("Failed to send frame header, disconnecting");
     return false;
   }
   return writeAll(g_micClient, data, len);
@@ -386,12 +378,10 @@ static void downloadAndPlayWav(const char *url)
   }
 
   Serial.printf("Downloading WAV: %s\n", url);
-  logRemote(String("Downloading WAV: ") + url);
   HTTPClient http;
   if (!http.begin(url))
   {
     Serial.println("HTTP begin failed");
-    logRemote("HTTP begin failed for playback");
     return;
   }
 
@@ -399,7 +389,6 @@ static void downloadAndPlayWav(const char *url)
   if (code != HTTP_CODE_OK)
   {
     Serial.printf("HTTP error: %d\n", code);
-    logRemote(String("HTTP playback error: ") + code);
     http.end();
     return;
   }
@@ -409,7 +398,6 @@ static void downloadAndPlayWav(const char *url)
   if (stream->readBytes(header, sizeof(header)) != sizeof(header))
   {
     Serial.println("Failed to read WAV header");
-   logRemote("Failed to read WAV header");
     http.end();
     return;
   }
@@ -438,7 +426,6 @@ static void downloadAndPlayWav(const char *url)
     int len = stream->readBytes(buffer, sizeof(buffer));
     if (len <= 0)
     {
-      logRemote("Playback stream ended");
       break;
     }
     if (g_cancelPlayback)
@@ -462,19 +449,4 @@ static void downloadAndPlayWav(const char *url)
   }
   http.end();
   Serial.println("Playback finished");
-  logRemote("Playback finished");
-}
-
-static void logRemote(const char *message)
-{
-  if (!message)
-  {
-    return;
-  }
-  g_telemetryClient.postLog(message);
-}
-
-static void logRemote(const String &message)
-{
-  g_telemetryClient.postLog(message);
 }

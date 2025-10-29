@@ -2,27 +2,26 @@
 [English Version](README_EN.md)
 
 ## 项目概述
-本项目基于 ESP32（FireBeetle 2 ESP32-E）实现语音桥接与跌倒检测，同时配套 Python 服务器与 Deepgram 语音代理集成。设备通过 I2S 麦克风与扬声器实现全双工音频，采集 MPU6050 跌倒状态数据，支持远程日志与音频播放。
+本项目基于 ESP32（FireBeetle 2 ESP32-E）实现语音桥接与跌倒检测，同时配套 Python 服务器与 Deepgram 语音代理集成。设备通过 I2S 麦克风与扬声器实现全双工音频，采集 MPU6050 跌倒状态并驱动 LED 指示，同时支持远程触发音频播放。
 
 ## 主要功能
 - **语音桥接**：ESP32 以 PCM 流方式推送麦克风数据，Python 服务器与 Deepgram Agent 交互，实现语音问答与自定义音频播放。
 - **音频播放队列**：服务器可下发播放命令（WAV），固件自动下载、播放并在播放期间暂停上行麦克风数据以避免回声。
 - **跌倒检测**：基于 MPU6050 的姿态与冲击分析，将跌倒状态与告警同步到后端。
 - **LED 状态指示**：NeoPixel 灯环指示校准、监控、跌倒警报、语音监听/播报等多种状态。
-- **遥测与事件上传**：固件定期向 Python 服务器上报 JSON 遥测数据并支持日志事件；服务器可提供最新数据给语音代理回答用户询问。
 
 ## 目录结构
 ```
-├─include/           C++ 头文件（Telemetry、SensorManager 等）
-├─lib/               可选 Arduino 库（项目默认未使用）
-├─python/            Python 服务端与工具脚本
-│  ├─server.py       Deepgram Agent 桥接与遥测 HTTP API
-│  └─make_clip.py    WAV 片段制作辅助脚本
-├─src/               ESP32 固件主程序
-│  ├─main.cpp        音频桥接、播放队列、Mic 传输
+├─include/           C++ 头文件 (TelemetryClient, SensorManager 等)
+├─lib/               可选 Arduino 库（默认未使用）
+├─python/            Python 服务与工具脚本
+│  ├─server.py       Deepgram Agent 音频桥接 & 播放 API
+│  └─make_clip.py    WAV 测试音频生成脚本
+├─src/               ESP32 固件源码
+│  ├─main.cpp        音频桥接、播放、麦克风上传
 │  └─SensorManager.cpp  跌倒检测与 LED 控制
-├─platformio.ini     PlatformIO 工程配置
-└─README.md / README_EN.md
+├─platformio.ini     PlatformIO 项目配置
+├─README.md / README_EN.md
 ```
 
 ## 快速上手
@@ -68,14 +67,12 @@
 - **Speech Speaking**：白色呼吸（语音播报）
 
 ## 遥测与接口
-- `POST /api/devices/{deviceId}/telemetry`：接收 ESP32 上报的跌倒监测数据。
 - `POST /api/audio/play`：服务器向 ESP32 下发播放命令（`{"clip": "...wav"}` 或 `{"url": "..."}`）。
 - `POST /api/audio/playback_done`：ESP32 播放结束通知，服务器即时恢复麦克风。
-- `GET /api/devices`：查看最新遥测快照、事件与连接状态。
 
 ## 常见问题
 - **麦克风延迟恢复**：若播放结束后仍看到 “fallback” 提示，请确认 ESP32 能访问 Python 服务器的 `playback_done` 接口以及网络防火墙设置。
-- **Deepgram 连接失败或 Agent 未响应跌倒信息**：检查 `DEEPGRAM_API_KEY`、网络连通性，以及 `server.py` 日志和 `/api/devices` 返回的最新遥测数据。
+- **Deepgram 连接失败或 Agent 未响应播放命令**：检查 `DEEPGRAM_API_KEY`、网络连通性，以及服务器日志，确认 `/api/audio/playback_done` 已成功调用。
 
 ## 贡献
 欢迎提交 Issue 或 Pull Request。建议在修改前先讨论需求与方案以保持固件与服务器同步演进。

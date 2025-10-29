@@ -4,9 +4,8 @@
 
 /**
  * Starts the background task that handles fall detection, LED status
- * rendering, telemetry uploads, and alert audio queueing. The
- * TelemetryClient instance must remain valid for the lifetime of the
- * firmware.
+ * rendering, and alert audio queueing. The TelemetryClient instance
+ * must remain valid for the lifetime of the firmware.
  */
 void startSensorManagerTask(TelemetryClient *client);
 

@@ -15,14 +15,8 @@ public:
 
   bool isReady() const;
 
-  bool postTelemetry(const String &jsonPayload) const;
-  bool postEvent(const String &jsonPayload) const;
-
-  bool postLog(const String &message) const;
-
   bool queueAudioClip(const String &clipName) const;
   bool queueAudioUrl(const String &url) const;
-  bool queueRawCommand(const String &command) const;
   bool notifyPlaybackFinished() const;
 
 private:

@@ -1,7 +1,5 @@
 #include "TelemetryClient.h"
 
-#include "TelemetryClient.h"
-
 #include <Arduino.h>
 #include <HTTPClient.h>
 
@@ -32,52 +30,6 @@ String trimLeadingSlash(const String &value)
   return value.substring(index);
 }
 
-String escapeJson(const String &input)
-{
-  String output;
-  output.reserve(input.length());
-  for (size_t i = 0; i < input.length(); ++i)
-  {
-    char c = input.charAt(i);
-    switch (c)
-    {
-    case '\"':
-      output += "\\\"";
-      break;
-    case '\\':
-      output += "\\\\";
-      break;
-    case '\b':
-      output += "\\b";
-      break;
-    case '\f':
-      output += "\\f";
-      break;
-    case '\n':
-      output += "\\n";
-      break;
-    case '\r':
-      output += "\\r";
-      break;
-    case '\t':
-      output += "\\t";
-      break;
-    default:
-      if (static_cast<uint8_t>(c) < 0x20)
-      {
-        char buffer[7];
-        snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<unsigned>(c));
-        output += buffer;
-      }
-      else
-      {
-        output += c;
-      }
-      break;
-    }
-  }
-  return output;
-}
 } // namespace
 
 TelemetryClient::TelemetryClient() = default;
@@ -95,32 +47,6 @@ void TelemetryClient::setDeviceId(const String &deviceId)
 bool TelemetryClient::isReady() const
 {
   return _baseUrl.length() > 0 && _deviceId.length() > 0;
-}
-
-bool TelemetryClient::postTelemetry(const String &jsonPayload) const
-{
-  if (!isReady())
-  {
-    Serial.println("[TEL] client not ready, skip telemetry");
-    return false;
-  }
-  String path = "/api/devices/" + _deviceId + "/telemetry";
-  if (_baseUrl.endsWith("/"))
-  {
-    Serial.println("[TEL] base URL should not end with '/', adjusting automatically");
-  }
-  return postJson(composeUrl(path), jsonPayload);
-}
-
-bool TelemetryClient::postEvent(const String &jsonPayload) const
-{
-  if (!isReady())
-  {
-    Serial.println("[TEL] client not ready, skip event");
-    return false;
-  }
-  String path = "/api/devices/" + _deviceId + "/events";
-  return postJson(composeUrl(path), jsonPayload);
 }
 
 bool TelemetryClient::queueAudioClip(const String &clipName) const
@@ -148,20 +74,6 @@ bool TelemetryClient::queueAudioUrl(const String &url) const
   payload += "\"}";
   return postJson(composeUrl("/api/audio/play"), payload);
 }
-
-bool TelemetryClient::queueRawCommand(const String &command) const
-{
-  if (!isReady())
-  {
-    Serial.println("[TEL] base URL not set, cannot queue command");
-    return false;
-  }
-  String payload = "{\"command\":\"";
-  payload += command;
-  payload += "\"}";
-  return postJson(composeUrl("/api/audio/play"), payload);
-}
-
 bool TelemetryClient::notifyPlaybackFinished() const
 {
   if (!isReady())
@@ -208,19 +120,4 @@ bool TelemetryClient::postJson(const String &url, const String &jsonPayload) con
     return false;
   }
   return true;
-}
-
-bool TelemetryClient::postLog(const String &message) const
-{
-  if (!isReady())
-  {
-    Serial.println("[TEL] client not ready, skip log");
-    return false;
-  }
-  String payload = "{\"timestamp\":";
-  payload += String(millis());
-  payload += ",\"type\":\"LOG\",\"message\":\"";
-  payload += escapeJson(message);
-  payload += "\"}";
-  return postEvent(payload);
 }

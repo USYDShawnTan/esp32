@@ -46,9 +46,7 @@ HTTP_BASE_URL = os.getenv("HTTP_BASE_URL", f"http://192.168.137.1:{HTTP_PORT}/da
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-STATIC_DIR = BASE_DIR / "static"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_OUTPUT_CLIP = "agent-output.wav"
 PRESET_GREETING_CLIP = "agent-greeting.wav"
 SAFE_UNMUTE_PAD = 0.05  # seconds of extra cushion before resuming microphone
@@ -71,58 +69,6 @@ def iso_timestamp(ts: Optional[float] = None) -> str:
     )
 
 
-class TelemetryStore:
-    def __init__(self) -> None:
-        self._devices: Dict[str, Dict[str, Any]] = {}
-        self._events: list[Dict[str, Any]] = []
-        self._lock = asyncio.Lock()
-
-    async def update_device(self, device_id: str, payload: Dict[str, Any]) -> None:
-        device_ts = payload.get("timestamp")
-        if isinstance(device_ts, (int, float)):
-            payload["deviceTimestamp"] = device_ts
-        recorded_ts = time.time()
-        payload["timestamp"] = recorded_ts
-        record = {
-            "deviceId": device_id,
-            "timestamp": recorded_ts,
-            "isoTimestamp": iso_timestamp(recorded_ts),
-            "data": payload,
-        }
-        async with self._lock:
-            self._devices[device_id] = record
-
-    async def record_event(self, device_id: str, payload: Dict[str, Any]) -> None:
-        device_ts = payload.get("timestamp")
-        if isinstance(device_ts, (int, float)):
-            payload["deviceTimestamp"] = device_ts
-        recorded_ts = time.time()
-        payload["timestamp"] = recorded_ts
-        entry = {
-            "deviceId": device_id,
-            "timestamp": recorded_ts,
-            "isoTimestamp": iso_timestamp(recorded_ts),
-            "data": payload,
-        }
-        async with self._lock:
-            self._events.append(entry)
-            if len(self._events) > 200:
-                self._events = self._events[-200:]
-
-    async def snapshot(self) -> Dict[str, Any]:
-        async with self._lock:
-            devices = list(self._devices.values())
-            events = list(self._events)
-        return {"devices": devices, "events": events}
-
-    async def latest_any(self) -> Optional[Dict[str, Any]]:
-        async with self._lock:
-            if not self._devices:
-                return None
-            return max(self._devices.values(), key=lambda item: item["timestamp"])
-
-
-telemetry_store = TelemetryStore()
 class BridgeState:
     def __init__(self) -> None:
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -545,37 +491,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         await bridge_state.detach()
 
 
-async def handle_post_telemetry(request: web.Request) -> web.Response:
-    device_id = request.match_info["device_id"]
-    try:
-        payload = await request.json()
-    except json.JSONDecodeError:
-        raise web.HTTPBadRequest(text="Invalid JSON payload.")
-
-    await telemetry_store.update_device(device_id, payload)
-
-    alerts = payload.get("alerts")
-    if isinstance(alerts, list):
-        for alert in alerts:
-            if isinstance(alert, dict):
-                await telemetry_store.record_event(device_id, alert)
-            else:
-                await telemetry_store.record_event(device_id, {"type": str(alert)})
-
-    return web.json_response({"status": "ok"})
-
-
-async def handle_post_event(request: web.Request) -> web.Response:
-    device_id = request.match_info["device_id"]
-    try:
-        payload = await request.json()
-    except json.JSONDecodeError:
-        raise web.HTTPBadRequest(text="Invalid JSON payload.")
-
-    await telemetry_store.record_event(device_id, payload)
-    return web.json_response({"status": "ok"})
-
-
 async def handle_post_audio_play(request: web.Request) -> web.Response:
     if not bridge_state.connected.is_set():
         raise web.HTTPServiceUnavailable(text="ESP32 bridge is not connected.")
@@ -614,21 +529,11 @@ async def handle_post_audio_playback_done(_request: web.Request) -> web.Response
     return web.json_response({"status": "ok"})
 
 
-async def handle_get_devices(_request: web.Request) -> web.Response:
-    snapshot = await telemetry_store.snapshot()
-    snapshot["bridge"] = bridge_state.status()
-    snapshot["audioBaseUrl"] = HTTP_BASE_URL.rstrip("/")
-    return web.json_response(snapshot)
-
-
 async def handle_root(_request: web.Request) -> web.StreamResponse:
-    index_path = STATIC_DIR / "index.html"
-    if index_path.is_file():
-        return web.FileResponse(index_path)
     return web.Response(
         text=(
             "ESP32 audio bridge backend is running.\n"
-            "Use the /api/devices endpoint for telemetry and /api/audio/play to queue audio."
+            "Use /api/audio/play to queue clips for the ESP32."
         ),
         content_type="text/plain",
     )
@@ -639,15 +544,11 @@ def create_app() -> web.Application:
     app.add_routes(
         [
             web.get("/", handle_root),
-            web.get("/api/devices", handle_get_devices),
-            web.post("/api/devices/{device_id}/telemetry", handle_post_telemetry),
-            web.post("/api/devices/{device_id}/events", handle_post_event),
             web.post("/api/audio/play", handle_post_audio_play),
             web.post("/api/audio/playback_done", handle_post_audio_playback_done),
         ]
     )
     app.router.add_static("/data/", DATA_DIR, show_index=True)
-    app.router.add_static("/static/", STATIC_DIR, show_index=True)
     return app
 
 

@@ -12,7 +12,6 @@
 #endif
 
 #include "TelemetryClient.h"
-#include "TelemetryPayloadBuilder.h"
 
 namespace
 {
@@ -24,7 +23,6 @@ constexpr uint8_t LED_RING_PIN = 4;
 constexpr uint16_t LED_RING_COUNT = 16;
 
 constexpr uint32_t SENSOR_LOOP_DELAY_MS = 20;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 2000;
 constexpr uint32_t STATUS_PRINT_INTERVAL_MS = 5000;
 
 constexpr float FALL_IMPACT_THRESHOLD_G = 2.0f;
@@ -119,15 +117,6 @@ SpeechLedMode currentSpeechLedMode();
 FallReading updateFallDetector(FallContext &ctx, unsigned long nowMs);
 
 void sensorTask(void *param);
-
-void logMessage(TelemetryClient *client, const String &message)
-{
-  if (!client || !client->isReady())
-  {
-    return;
-  }
-  client->postLog(message);
-}
 
 } // namespace
 
@@ -502,15 +491,12 @@ void sensorTask(void *param)
     fall.filteredZ = 1.0f;
     Serial.print("[FALL] MPU6050 detected at 0x");
     Serial.println(fall.mpuAddr, HEX);
-    logMessage(client, "[FALL] MPU6050 detected");
   }
   else
   {
     Serial.println("[FALL][WARN] MPU6050 not found.");
-    logMessage(client, "[FALL][WARN] MPU6050 not found");
   }
 
-  unsigned long lastTelemetryMs = 0;
   unsigned long lastStatusMs = 0;
 
   for (;;)
@@ -524,50 +510,18 @@ void sensorTask(void *param)
     {
       const String message = "[AUDIO] Fall detected";
       Serial.println(message);
-      logMessage(client, message);
       if (!client->queueAudioClip(FALL_ALERT_CLIP))
       {
         Serial.println("[AUDIO] Failed to queue fall alert clip");
-        logMessage(client, "[AUDIO][ERR] Failed to queue fall alert clip");
       }
     }
     if (fallReading.fallRecovered && client)
     {
       const String message = "[AUDIO] Fall recovery detected";
       Serial.println(message);
-      logMessage(client, message);
       if (!client->queueAudioClip(FALL_CLEAR_CLIP))
       {
         Serial.println("[AUDIO] Failed to queue all-clear clip");
-        logMessage(client, "[AUDIO][ERR] Failed to queue all-clear clip");
-      }
-    }
-
-    if (nowMs - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)
-    {
-      lastTelemetryMs = nowMs;
-      TelemetryPayloadBuilder builder;
-      builder.reset();
-
-      if (fallReading.available)
-      {
-        float tiltValue = isnan(fallReading.tiltDeg) ? 0.0f : fallReading.tiltDeg;
-        float impactValue = isnan(fallReading.accelMag) ? 0.0f : fallReading.accelMag;
-        builder.setFall(fallStateToString(fallReading.state), tiltValue, impactValue);
-        if (fallReading.fallTriggered)
-        {
-          String detail = "tilt=" + String(tiltValue, 1) + "deg";
-          builder.addAlert("FALL_DETECTED", detail);
-        }
-      }
-
-      if (client && client->isReady())
-      {
-        String payload = builder.build(nowMs);
-        if (!client->postTelemetry(payload))
-        {
-          Serial.println("[TEL] Failed to post telemetry");
-        }
       }
     }
 
