@@ -57,6 +57,37 @@ static void downloadAndPlayWav(const char *url);
 static void logRemote(const char *message);
 static void logRemote(const String &message);
 
+class MicUploadPauseGuard
+{
+public:
+  explicit MicUploadPauseGuard(volatile bool &flag)
+      : _flag(&flag), _prev(flag)
+  {
+    *_flag = true;
+  }
+
+  MicUploadPauseGuard(const MicUploadPauseGuard &) = delete;
+  MicUploadPauseGuard &operator=(const MicUploadPauseGuard &) = delete;
+
+  ~MicUploadPauseGuard()
+  {
+    resume();
+  }
+
+  void resume()
+  {
+    if (_flag)
+    {
+      *_flag = _prev;
+      _flag = nullptr;
+    }
+  }
+
+private:
+  volatile bool *_flag;
+  bool _prev;
+};
+
 #ifndef TELEMETRY_BASE_URL
 #define TELEMETRY_BASE_URL "http://192.168.137.1:8000"
 #endif
@@ -208,7 +239,7 @@ static void micStreamTask(void *param)
     size_t payloadBytes = samples * sizeof(int16_t);
     if (g_pauseMicUpload)
     {
-      vTaskDelay(pdMS_TO_TICKS(10));
+      vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
     if (!sendFrame((uint8_t *)pcmBuffer, payloadBytes))
@@ -384,8 +415,7 @@ static void downloadAndPlayWav(const char *url)
   }
 
   g_cancelPlayback = false;
-  bool prevPauseState = g_pauseMicUpload;
-  g_pauseMicUpload = true;
+  MicUploadPauseGuard micPauseGuard(g_pauseMicUpload);
   bool suppressSpeechLed = false;
   bool appliedSpeechLed = false;
 
@@ -421,8 +451,7 @@ static void downloadAndPlayWav(const char *url)
 
   digitalWrite(SPK_SD, LOW);
   g_cancelPlayback = false;
-  vTaskDelay(pdMS_TO_TICKS(50));
-  g_pauseMicUpload = prevPauseState;
+  micPauseGuard.resume();
   if (appliedSpeechLed)
   {
     sensorManagerClearSpeechOverride();
