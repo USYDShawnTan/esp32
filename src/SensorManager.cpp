@@ -5,124 +5,132 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <Wire.h>
+#include <math.h>
 
-#ifdef I2C_BUFFER_LENGTH
-#undef I2C_BUFFER_LENGTH
-#define I2C_BUFFER_LENGTH 128
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
-
-#include "TelemetryClient.h"
 
 namespace
 {
   constexpr uint8_t I2C_SDA_PIN = 21;
   constexpr uint8_t I2C_SCL_PIN = 22;
 
-  // LED ring hardware configuration (FireBeetle's on-board NeoPixel ring).
   constexpr uint8_t LED_RING_PIN = 4;
   constexpr uint16_t LED_RING_COUNT = 16;
+  constexpr uint32_t LED_BRIGHTNESS = 96;
 
-  constexpr uint32_t SENSOR_LOOP_DELAY_MS = 20;
-  constexpr uint32_t STATUS_PRINT_INTERVAL_MS = 5000;
+  // Motion processing parameters
+  constexpr uint32_t MOTION_LOOP_DELAY_MS = 20;
+  constexpr uint32_t BASELINE_SAMPLE_COUNT = 200;
+  constexpr uint32_t BASELINE_SETTLE_MS = 100;
 
-  constexpr float FALL_IMPACT_THRESHOLD_G = 2.0f;
-  constexpr float FALL_TILT_ENTER_DEG = 60.0f;
-  constexpr float FALL_TILT_EXIT_DEG = 45.0f;
-  constexpr float FALL_UPRIGHT_DEG = 25.0f;
-  constexpr uint32_t FALL_CALIB_MIN_SAMPLES = 200;
-  constexpr unsigned long FALL_TILT_HOLD_MS = 500;
-  constexpr unsigned long FALL_EXIT_STABLE_MS = 400;
-  constexpr unsigned long FALL_POST_WINDOW_MS = 2000;
-  constexpr unsigned long FALL_MIN_LOCK_MS = 2000;
-  constexpr unsigned long FALL_UPRIGHT_HOLD_MS = 1000;
-  constexpr unsigned long FALL_IMPACT_COOLDOWN_MS = 1500;
+  constexpr bool ENABLE_SENSOR_DEBUG = true;
+  constexpr uint32_t SENSOR_DEBUG_INTERVAL_MS = 250;
 
-  constexpr const char *FALL_ALERT_CLIP = "alert_fall_detected.wav";
-  constexpr const char *FALL_CLEAR_CLIP = "status_all_clear.wav";
+  constexpr float MOTION_IDLE_THRESHOLD = 0.05f;
+  constexpr float MOTION_ACTIVE_THRESHOLD = 0.18f;
+  constexpr float MOTION_WAVE_THRESHOLD = 0.42f;
+  constexpr float MOTION_OVERLOAD_THRESHOLD = 0.75f;
 
-  enum class FallState
+  constexpr uint32_t ENERGY_DECAY_MS = 600;
+  constexpr uint32_t OVERLOAD_DECAY_MS = 900;
+
+  constexpr float ANGLE_PICKUP_ENTER_DEG = 7.0f;
+  constexpr float ANGLE_PICKUP_EXIT_DEG = 3.0f;
+  constexpr float ANGLE_PICKUP_CONFIRM_DEG = 11.0f;
+  constexpr uint32_t PICKUP_MIN_DURATION_MS = 600;
+  constexpr uint32_t PUTDOWN_MIN_DURATION_MS = 800;
+  constexpr float LATERAL_ACCEL_EXIT = 0.15f;
+
+  enum class SystemState
   {
-    Calibrating,
-    Monitoring,
-    PostImpact,
-    FallDetected
+    Initializing,
+    Idle,
+    Ready,
+    EnergyWave,
+    Overload,
+    ModeCycling
   };
-
-  struct SensorTaskArgs
-  {
-    TelemetryClient *client;
-  };
-
-  struct FallContext
-  {
-    bool present = false;
-    uint8_t mpuAddr = 0x68;
-    FallState state = FallState::Calibrating;
-    float base_gx = 0.0f;
-    float base_gy = 0.0f;
-    float base_gz = 0.0f;
-    uint32_t baseSamples = 0;
-    unsigned long startCalibMs = 0;
-    unsigned long monitoringSinceMs = 0;
-    unsigned long impactDetectedMs = 0;
-    unsigned long tiltStartMs = 0;
-    unsigned long exitStableStartMs = 0;
-    unsigned long fellTimeMs = 0;
-    unsigned long uprightStartMs = 0;
-    float filteredX = 0.0f;
-    float filteredY = 0.0f;
-    float filteredZ = 1.0f;
-    bool alertIssued = false;
-  };
-
-  struct FallReading
-  {
-    bool available = false;
-    float accelMag = NAN;
-    float tiltDeg = NAN;
-    FallState state = FallState::Calibrating;
-    bool fallTriggered = false;
-    bool fallRecovered = false;
-  };
-
-  // Central LED ring instance used to convey sensor and fall-detection states.
-  Adafruit_NeoPixel g_ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
-  TelemetryClient *g_client = nullptr;
 
   enum class SpeechLedMode
   {
-    Idle,
+    None,
     Listening,
     Speaking
   };
 
-  portMUX_TYPE g_speechLedMux = portMUX_INITIALIZER_UNLOCKED;
-  SpeechLedMode g_speechLedMode = SpeechLedMode::Idle;
+  struct MotionContext
+  {
+    bool present = false;
+    uint8_t mpuAddr = 0x68;
 
-  portMUX_TYPE g_monitoringMux = portMUX_INITIALIZER_UNLOCKED;
-  bool g_monitoringUnlocked = false;
+    bool baselineCalibrated = false;
+    float baseX = 0.0f;
+    float baseY = 0.0f;
+    float baseZ = 1.0f;
+    float baseSumX = 0.0f;
+    float baseSumY = 0.0f;
+    float baseSumZ = 0.0f;
+    uint32_t baseSamples = 0;
+    unsigned long baselineStartMs = 0;
+
+    float filteredMotion = 0.0f;
+    float filteredAngle = 0.0f;
+
+    bool energyActive = false;
+    bool overloadActive = false;
+    unsigned long lastEnergyMs = 0;
+    unsigned long lastOverloadMs = 0;
+
+    SystemState state = SystemState::Initializing;
+
+    bool inHand = false;
+    bool putdownCandidate = false;
+    unsigned long putdownCandidateStartMs = 0;
+    float netAlongBaseline = 0.0f;
+    float filteredLateral = 0.0f;
+    bool pickupCandidate = false;
+    unsigned long pickupCandidateStartMs = 0;
+    unsigned long lastDebugPrintMs = 0;
+  };
+
+  Adafruit_NeoPixel g_ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
+
+  portMUX_TYPE g_speechMux = portMUX_INITIALIZER_UNLOCKED;
+  SpeechLedMode g_speechMode = SpeechLedMode::None;
+  bool g_modeCycleRequest = false;
 
   // Forward declarations
-  bool scanMpuAddress(FallContext &ctx);
+  bool scanMpuAddress(MotionContext &ctx);
   bool writeMpuReg(uint8_t addr, uint8_t reg, uint8_t value);
-  bool readAccelG(const FallContext &ctx, float &ax_g, float &ay_g, float &az_g);
-  float angleDeg(float ax, float ay, float az, float bx, float by, float bz);
+  bool readAccelG(const MotionContext &ctx, float &ax, float &ay, float &az);
   void normalize(float &x, float &y, float &z);
+  float angleBetween(float ax, float ay, float az, float bx, float by, float bz);
 
-  const char *fallStateToString(FallState state);
-  void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAlertActive);
-  void renderSpeechListeningEffect(unsigned long nowMs);
-  void renderSpeechSpeakingEffect(unsigned long nowMs);
+  void updateMotion(MotionContext &ctx, unsigned long nowMs);
+  void updateState(MotionContext &ctx, unsigned long nowMs);
 
-  void setSpeechLedMode(SpeechLedMode mode);
-  SpeechLedMode currentSpeechLedMode();
-
-  FallReading updateFallDetector(FallContext &ctx, unsigned long nowMs);
-  bool isMonitoringUnlocked();
+  void renderState(const MotionContext &ctx, unsigned long nowMs);
+  void renderInitializing(unsigned long nowMs);
+  void renderIdle(unsigned long nowMs);
+  void renderReady(unsigned long nowMs);
+  void renderEnergyWave(unsigned long nowMs);
+  void renderOverload(unsigned long nowMs);
+  void renderModeCycling(unsigned long nowMs);
+  void renderSpeechListening(unsigned long nowMs);
+  void renderSpeechSpeaking(unsigned long nowMs);
 
   void sensorTask(void *param);
-
+  SpeechLedMode currentSpeechLedMode();
+  void setSpeechLedMode(SpeechLedMode mode);
 } // namespace
+
+void startSensorManagerTask(TelemetryClient *client)
+{
+  (void)client;
+  xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, nullptr, 1, nullptr, 1);
+}
 
 void sensorManagerTriggerSpeechListening()
 {
@@ -136,35 +144,24 @@ void sensorManagerTriggerSpeechSpeaking()
 
 void sensorManagerClearSpeechOverride()
 {
-  setSpeechLedMode(SpeechLedMode::Idle);
+  setSpeechLedMode(SpeechLedMode::None);
 }
 
 void sensorManagerUnlockMonitoring()
 {
-  portENTER_CRITICAL(&g_monitoringMux);
-  g_monitoringUnlocked = true;
-  portEXIT_CRITICAL(&g_monitoringMux);
-}
-
-void startSensorManagerTask(TelemetryClient *client)
-{
-  static SensorTaskArgs args{};
-  args.client = client;
-  g_client = client;
-  xTaskCreatePinnedToCore(sensorTask, "sensorTask", 8192, &args, 1, nullptr, 1);
+  // No-op in the new state model; kept for backwards compatibility.
 }
 
 namespace
 {
-
-  bool scanMpuAddress(FallContext &ctx)
+  bool scanMpuAddress(MotionContext &ctx)
   {
-    for (uint8_t candidate : {0x68, 0x69})
+    for (uint8_t addr : {uint8_t(0x68), uint8_t(0x69)})
     {
-      Wire.beginTransmission(candidate);
+      Wire.beginTransmission(addr);
       if (Wire.endTransmission() == 0)
       {
-        ctx.mpuAddr = candidate;
+        ctx.mpuAddr = addr;
         return true;
       }
     }
@@ -179,7 +176,7 @@ namespace
     return Wire.endTransmission() == 0;
   }
 
-  bool readAccelG(const FallContext &ctx, float &ax_g, float &ay_g, float &az_g)
+  bool readAccelG(const MotionContext &ctx, float &ax, float &ay, float &az)
   {
     Wire.beginTransmission(ctx.mpuAddr);
     Wire.write(0x3B);
@@ -187,380 +184,513 @@ namespace
     {
       return false;
     }
-    if (Wire.requestFrom(static_cast<int>(ctx.mpuAddr), 6) < 6)
+    constexpr size_t bytes = 6;
+    if (Wire.requestFrom(ctx.mpuAddr, static_cast<uint8_t>(bytes)) != bytes)
     {
       return false;
     }
+    int16_t rawAx = (Wire.read() << 8) | Wire.read();
+    int16_t rawAy = (Wire.read() << 8) | Wire.read();
+    int16_t rawAz = (Wire.read() << 8) | Wire.read();
 
-    int16_t ax = (Wire.read() << 8) | Wire.read();
-    int16_t ay = (Wire.read() << 8) | Wire.read();
-    int16_t az = (Wire.read() << 8) | Wire.read();
-
-    ax_g = static_cast<float>(ax) / 16384.0f;
-    ay_g = static_cast<float>(ay) / 16384.0f;
-    az_g = static_cast<float>(az) / 16384.0f;
+    constexpr float scale = 16384.0f; // +/-2g
+    ax = static_cast<float>(rawAx) / scale;
+    ay = static_cast<float>(rawAy) / scale;
+    az = static_cast<float>(rawAz) / scale;
     return true;
   }
 
   void normalize(float &x, float &y, float &z)
   {
-    float mag = sqrtf(x * x + y * y + z * z);
-    if (mag > 1e-6f)
+    const float mag = sqrtf(x * x + y * y + z * z);
+    if (mag < 1e-6f)
     {
-      x /= mag;
-      y /= mag;
-      z /= mag;
-    }
-  }
-
-  float angleDeg(float ax, float ay, float az, float bx, float by, float bz)
-  {
-    float dot = ax * bx + ay * by + az * bz;
-    dot = fmaxf(-1.0f, fminf(1.0f, dot));
-    return acosf(dot) * 180.0f / PI;
-  }
-
-  const char *fallStateToString(FallState state)
-  {
-    switch (state)
-    {
-    case FallState::Calibrating:
-      return "CALIBRATING";
-    case FallState::Monitoring:
-      return "MONITORING";
-    case FallState::PostImpact:
-      return "POST_IMPACT";
-    case FallState::FallDetected:
-      return "FALL_DETECTED";
-    default:
-      return "UNKNOWN";
-    }
-  }
-
-  // Shared LED helpers so speech-aware components can render consistent animations.
-  void renderSpeechListeningEffect(unsigned long nowMs)
-  {
-    // Dim white ring with a single bright pixel rotating clockwise.
-    uint32_t baseColor = g_ledRing.Color(8, 8, 8);
-    g_ledRing.fill(baseColor, 0, LED_RING_COUNT);
-    int chaseIndex = (nowMs / 120) % LED_RING_COUNT;
-    g_ledRing.setPixelColor(chaseIndex, g_ledRing.Color(180, 180, 180));
-  }
-
-  void renderSpeechSpeakingEffect(unsigned long nowMs)
-  {
-    // Brisk white flash while speech playback is active.
-    bool on = ((nowMs / 150) % 2) == 0;
-    uint32_t color = on ? g_ledRing.Color(255, 255, 255) : g_ledRing.Color(0, 0, 0);
-    g_ledRing.fill(color, 0, LED_RING_COUNT);
-  }
-
-  void setSpeechLedMode(SpeechLedMode mode)
-  {
-    portENTER_CRITICAL(&g_speechLedMux);
-    g_speechLedMode = mode;
-    portEXIT_CRITICAL(&g_speechLedMux);
-  }
-
-  SpeechLedMode currentSpeechLedMode()
-  {
-    portENTER_CRITICAL(&g_speechLedMux);
-    SpeechLedMode mode = g_speechLedMode;
-    portEXIT_CRITICAL(&g_speechLedMux);
-    return mode;
-  }
-
-  bool isMonitoringUnlocked()
-  {
-    portENTER_CRITICAL(&g_monitoringMux);
-    bool unlocked = g_monitoringUnlocked;
-    portEXIT_CRITICAL(&g_monitoringMux);
-    return unlocked;
-  }
-
-  // Render the LED ring according to the current fall-detection state.
-  // Each state maps to a distinctive animation so operators can gauge status at a glance.
-  void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAlertActive)
-  {
-    SpeechLedMode speechOverride = currentSpeechLedMode();
-    if (speechOverride == SpeechLedMode::Listening)
-    {
-      renderSpeechListeningEffect(nowMs);
-      g_ledRing.show();
+      x = y = 0.0f;
+      z = 1.0f;
       return;
     }
-    if (speechOverride == SpeechLedMode::Speaking)
+    x /= mag;
+    y /= mag;
+    z /= mag;
+  }
+
+  float angleBetween(float ax, float ay, float az, float bx, float by, float bz)
+  {
+    const float dot = ax * bx + ay * by + az * bz;
+    const float magA = sqrtf(ax * ax + ay * ay + az * az);
+    const float magB = sqrtf(bx * bx + by * by + bz * bz);
+    if (magA < 1e-6f || magB < 1e-6f)
     {
-      renderSpeechSpeakingEffect(nowMs);
-      g_ledRing.show();
+      return 0.0f;
+    }
+    float cosTheta = dot / (magA * magB);
+    cosTheta = fminf(fmaxf(cosTheta, -1.0f), 1.0f);
+    return acosf(cosTheta) * 180.0f / static_cast<float>(M_PI);
+  }
+
+  void updateMotion(MotionContext &ctx, unsigned long nowMs)
+  {
+    float ax, ay, az;
+    if (!ctx.present || !readAccelG(ctx, ax, ay, az))
+    {
+      ctx.filteredMotion *= 0.95f;
+      ctx.filteredAngle *= 0.95f;
       return;
     }
 
-    switch (state)
+    if (!ctx.baselineCalibrated)
     {
-    case FallState::Calibrating:
+      if (ctx.baseSamples == 0)
+      {
+        ctx.baselineStartMs = nowMs;
+        ctx.baseSumX = ctx.baseSumY = ctx.baseSumZ = 0.0f;
+      }
+
+      ctx.baseSumX += ax;
+      ctx.baseSumY += ay;
+      ctx.baseSumZ += az;
+      ++ctx.baseSamples;
+
+      if (nowMs - ctx.baselineStartMs >= BASELINE_SETTLE_MS && ctx.baseSamples >= BASELINE_SAMPLE_COUNT)
+      {
+        ctx.baseX = ctx.baseSumX / static_cast<float>(ctx.baseSamples);
+        ctx.baseY = ctx.baseSumY / static_cast<float>(ctx.baseSamples);
+        ctx.baseZ = ctx.baseSumZ / static_cast<float>(ctx.baseSamples);
+        normalize(ctx.baseX, ctx.baseY, ctx.baseZ);
+        ctx.baselineCalibrated = true;
+        Serial.print("[SENS] Baseline calibrated. Vector=");
+        Serial.print(ctx.baseX, 3);
+        Serial.print(",");
+        Serial.print(ctx.baseY, 3);
+        Serial.print(",");
+        Serial.println(ctx.baseZ, 3);
+      }
+      return;
+    }
+
+    const float accelMag = sqrtf(ax * ax + ay * ay + az * az);
+    const float motion = fabsf(accelMag - 1.0f);
+    ctx.filteredMotion = ctx.filteredMotion * 0.90f + motion * 0.10f;
+
+    const float angle = angleBetween(ax, ay, az, ctx.baseX, ctx.baseY, ctx.baseZ);
+    ctx.filteredAngle = ctx.filteredAngle * 0.85f + angle * 0.15f;
+
+    const float projection = (ax * ctx.baseX + ay * ctx.baseY + az * ctx.baseZ);
+    const float along = projection - 1.0f;
+    ctx.netAlongBaseline = along;
+
+    float lateralSq = accelMag * accelMag - projection * projection;
+    if (lateralSq < 0.0f)
     {
-      // Breathing blue pulse while the IMU baseline is being established.
-      float phase = (nowMs % 6000) / 6000.0f;
-      float level = 0.15f + 0.65f * (0.5f + 0.5f * sinf(phase * 2.0f * PI));
-      uint8_t b = static_cast<uint8_t>(fminf(level, 1.0f) * 255.0f);
-      uint32_t color = g_ledRing.Color(0, 0, b);
-      g_ledRing.fill(color, 0, LED_RING_COUNT);
+      lateralSq = 0.0f;
+    }
+    const float lateral = sqrtf(lateralSq);
+    ctx.filteredLateral = ctx.filteredLateral * 0.80f + lateral * 0.20f;
+
+    const bool motionIdle = ctx.filteredMotion < MOTION_IDLE_THRESHOLD;
+    const bool angleActive = ctx.filteredAngle > ANGLE_PICKUP_ENTER_DEG;
+    const bool angleConfirm = ctx.filteredAngle > ANGLE_PICKUP_CONFIRM_DEG;
+    const bool angleIdle = ctx.filteredAngle < ANGLE_PICKUP_EXIT_DEG;
+    const bool lateralIdle = ctx.filteredLateral < LATERAL_ACCEL_EXIT;
+
+    const bool pickupSignal = angleActive;
+    const bool pickupConfirmed = angleConfirm;
+    const bool pickupReset = angleIdle && lateralIdle;
+    const bool putdownSignal = pickupReset && motionIdle;
+
+    if (!ctx.inHand)
+    {
+      if (pickupSignal)
+      {
+        if (!ctx.pickupCandidate)
+        {
+          ctx.pickupCandidate = true;
+          ctx.pickupCandidateStartMs = nowMs;
+        }
+        else if (pickupConfirmed && (nowMs - ctx.pickupCandidateStartMs) >= PICKUP_MIN_DURATION_MS)
+        {
+          ctx.inHand = true;
+          ctx.pickupCandidate = false;
+          ctx.pickupCandidateStartMs = 0;
+          ctx.putdownCandidate = false;
+          ctx.putdownCandidateStartMs = 0;
+          Serial.println("[SENS] Pickup confirmed -> Ready");
+        }
+      }
+      else if (pickupReset)
+      {
+        ctx.pickupCandidate = false;
+        ctx.pickupCandidateStartMs = 0;
+      }
+    }
+    else
+    {
+      ctx.pickupCandidate = false;
+      ctx.pickupCandidateStartMs = 0;
+
+      if (putdownSignal)
+      {
+        if (!ctx.putdownCandidate)
+        {
+          ctx.putdownCandidate = true;
+          ctx.putdownCandidateStartMs = nowMs;
+        }
+        else if ((nowMs - ctx.putdownCandidateStartMs) >= PUTDOWN_MIN_DURATION_MS)
+        {
+          ctx.inHand = false;
+          ctx.putdownCandidate = false;
+          ctx.putdownCandidateStartMs = 0;
+          Serial.println("[SENS] Putdown confirmed -> Idle");
+        }
+      }
+      else
+      {
+        ctx.putdownCandidate = false;
+        ctx.putdownCandidateStartMs = 0;
+      }
+    }
+
+    if (ctx.filteredMotion > MOTION_WAVE_THRESHOLD)
+    {
+      ctx.energyActive = true;
+      ctx.lastEnergyMs = nowMs;
+    }
+    else if (ctx.energyActive && nowMs - ctx.lastEnergyMs > ENERGY_DECAY_MS && ctx.filteredMotion < MOTION_ACTIVE_THRESHOLD)
+    {
+      ctx.energyActive = false;
+    }
+
+    if (ctx.filteredMotion > MOTION_OVERLOAD_THRESHOLD)
+    {
+      ctx.overloadActive = true;
+      ctx.lastOverloadMs = nowMs;
+    }
+    else if (ctx.overloadActive && nowMs - ctx.lastOverloadMs > OVERLOAD_DECAY_MS && ctx.filteredMotion < MOTION_ACTIVE_THRESHOLD)
+    {
+      ctx.overloadActive = false;
+    }
+
+    if (ENABLE_SENSOR_DEBUG && ctx.baselineCalibrated)
+    {
+      if (nowMs - ctx.lastDebugPrintMs >= SENSOR_DEBUG_INTERVAL_MS)
+      {
+        ctx.lastDebugPrintMs = nowMs;
+        const unsigned long pickMs = ctx.pickupCandidate ? (nowMs - ctx.pickupCandidateStartMs) : 0;
+        const unsigned long putMs = ctx.putdownCandidate ? (nowMs - ctx.putdownCandidateStartMs) : 0;
+        Serial.printf(
+            "[SENS][DBG] ax=%.3f ay=%.3f az=%.3f | |a|=%.3f motion=%.3f angle=%.1f | lat=%.3f along=%.3f inHand=%d pick=%d(%lu) put=%d(%lu)\n",
+            ax,
+            ay,
+            az,
+            accelMag,
+            ctx.filteredMotion,
+            ctx.filteredAngle,
+            ctx.filteredLateral,
+            ctx.netAlongBaseline,
+            ctx.inHand ? 1 : 0,
+            ctx.pickupCandidate ? 1 : 0,
+            pickMs,
+            ctx.putdownCandidate ? 1 : 0,
+            putMs);
+      }
+    }
+  }
+
+  void updateState(MotionContext &ctx, unsigned long nowMs)
+  {
+    if (!ctx.present)
+    {
+      ctx.state = SystemState::Initializing;
+      return;
+    }
+    if (!ctx.baselineCalibrated)
+    {
+      ctx.state = SystemState::Initializing;
+      return;
+    }
+
+    if (g_modeCycleRequest)
+    {
+      ctx.state = SystemState::ModeCycling;
+      if (nowMs - ctx.lastEnergyMs > 1200)
+      {
+        g_modeCycleRequest = false;
+      }
+      return;
+    }
+
+    if (ctx.overloadActive)
+    {
+      ctx.state = SystemState::Overload;
+      return;
+    }
+
+    if (ctx.energyActive && ctx.filteredMotion > MOTION_ACTIVE_THRESHOLD)
+    {
+      ctx.state = SystemState::EnergyWave;
+      return;
+    }
+
+    if (ctx.inHand)
+    {
+      ctx.state = SystemState::Ready;
+      return;
+    }
+
+    if (ctx.filteredMotion < MOTION_IDLE_THRESHOLD)
+    {
+      ctx.state = SystemState::Idle;
+      return;
+    }
+
+    ctx.state = SystemState::Ready;
+  }
+
+  uint32_t scaleColor(uint32_t color, float scale)
+  {
+    scale = fmaxf(0.0f, fminf(scale, 1.0f));
+    uint8_t r = static_cast<uint8_t>((color >> 16) & 0xFF);
+    uint8_t g = static_cast<uint8_t>((color >> 8) & 0xFF);
+    uint8_t b = static_cast<uint8_t>(color & 0xFF);
+    r = static_cast<uint8_t>(r * scale);
+    g = static_cast<uint8_t>(g * scale);
+    b = static_cast<uint8_t>(b * scale);
+    return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | b;
+  }
+
+  void clearRing()
+  {
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
+    {
+      g_ledRing.setPixelColor(i, 0);
+    }
+  }
+
+  void renderState(const MotionContext &ctx, unsigned long nowMs)
+  {
+    SpeechLedMode speechMode = currentSpeechLedMode();
+    if (speechMode == SpeechLedMode::Speaking)
+    {
+      renderSpeechSpeaking(nowMs);
+      return;
+    }
+    if (speechMode == SpeechLedMode::Listening)
+    {
+      renderSpeechListening(nowMs);
+      return;
+    }
+
+    switch (ctx.state)
+    {
+    case SystemState::Initializing:
+      renderInitializing(nowMs);
+      break;
+    case SystemState::Idle:
+      renderIdle(nowMs);
+      break;
+    case SystemState::Ready:
+      renderReady(nowMs);
+      break;
+    case SystemState::EnergyWave:
+      renderEnergyWave(nowMs);
+      break;
+    case SystemState::Overload:
+      renderOverload(nowMs);
+      break;
+    case SystemState::ModeCycling:
+      renderModeCycling(nowMs);
       break;
     }
-    case FallState::Monitoring:
+  }
+
+  void renderInitializing(unsigned long nowMs)
+  {
+    clearRing();
+    const float progress = fmodf(nowMs / 10.0f, static_cast<float>(LED_RING_COUNT));
+    const uint16_t lead = static_cast<uint16_t>(progress);
+    for (uint16_t i = 0; i <= lead && i < LED_RING_COUNT; ++i)
     {
-      // White chase indicates the system is passively listening for speech input.
-      renderSpeechListeningEffect(nowMs);
-      break;
-    }
-    case FallState::PostImpact:
-    {
-      // Amber blinking warns the system is in the post-impact cool-down window.
-      bool flash = ((nowMs / 200) % 2) == 0;
-      uint32_t color = flash ? g_ledRing.Color(255, 200, 0) : g_ledRing.Color(10, 10, 0);
-      g_ledRing.fill(color, 0, LED_RING_COUNT);
-      break;
-    }
-    case FallState::FallDetected:
-    {
-      // Bold red strobe draws immediate attention to an active fall alert.
-      bool flash = ((nowMs / 120) % 2) == 0;
-      uint32_t color = flash ? g_ledRing.Color(255, 0, 0) : g_ledRing.Color(0, 0, 0);
-      g_ledRing.fill(color, 0, LED_RING_COUNT);
-      break;
-    }
+      float scale = 0.2f + (static_cast<float>(i) / LED_RING_COUNT) * 0.8f;
+      g_ledRing.setPixelColor(i, scaleColor(g_ledRing.Color(0, 0, 80), scale));
     }
     g_ledRing.show();
   }
 
-  FallReading updateFallDetector(FallContext &ctx, unsigned long nowMs)
+  void renderIdle(unsigned long nowMs)
   {
-    FallReading reading{};
-    if (!ctx.present)
+    clearRing();
+    const float phase = (nowMs % 4000) / 4000.0f;
+    const float wave = 0.5f + 0.5f * sinf(phase * 2.0f * static_cast<float>(M_PI));
+    uint32_t color = g_ledRing.Color(0, 0, 180);
+    color = scaleColor(color, 0.25f + 0.75f * wave);
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
     {
-      return reading;
+      g_ledRing.setPixelColor(i, color);
     }
+    g_ledRing.show();
+  }
 
-    float ax, ay, az;
-    if (!readAccelG(ctx, ax, ay, az))
+  void renderReady(unsigned long nowMs)
+  {
+    clearRing();
+    const uint16_t index = static_cast<uint16_t>((nowMs / 120) % LED_RING_COUNT);
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
     {
-      return reading;
+      float scale = 0.05f;
+      int16_t diff = static_cast<int16_t>((i + LED_RING_COUNT) - index) % LED_RING_COUNT;
+      if (diff == 0)
+      {
+        scale = 1.0f;
+      }
+      else if (diff == 1 || diff == -1)
+      {
+        scale = 0.25f;
+      }
+      g_ledRing.setPixelColor(i, scaleColor(g_ledRing.Color(120, 120, 120), scale));
     }
+    g_ledRing.show();
+  }
 
-    float gx = ax;
-    float gy = ay;
-    float gz = az;
-    normalize(gx, gy, gz);
-
-    constexpr float alpha = 0.2f;
-    ctx.filteredX = (1.0f - alpha) * ctx.filteredX + alpha * gx;
-    ctx.filteredY = (1.0f - alpha) * ctx.filteredY + alpha * gy;
-    ctx.filteredZ = (1.0f - alpha) * ctx.filteredZ + alpha * gz;
-
-    float accelMag = sqrtf(ax * ax + ay * ay + az * az);
-    float tiltDeg = angleDeg(ctx.filteredX, ctx.filteredY, ctx.filteredZ, ctx.base_gx, ctx.base_gy, ctx.base_gz);
-
-    reading.available = true;
-    reading.accelMag = accelMag;
-    reading.tiltDeg = tiltDeg;
-    reading.state = ctx.state;
-
-    switch (ctx.state)
+  void renderEnergyWave(unsigned long nowMs)
+  {
+    clearRing();
+    const float phase = (nowMs % 1600) / 1600.0f;
+    const float pulse = 0.4f + 0.6f * sinf(phase * 2.0f * static_cast<float>(M_PI));
+    const uint32_t color = scaleColor(g_ledRing.Color(255, 120, 0), pulse);
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
     {
-    case FallState::Calibrating:
+      g_ledRing.setPixelColor(i, color);
+    }
+    g_ledRing.show();
+  }
+
+  void renderOverload(unsigned long nowMs)
+  {
+    clearRing();
+    const bool on = (nowMs / 120) % 2 == 0;
+    const uint32_t color = on ? g_ledRing.Color(255, 0, 0) : 0;
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
     {
-      ctx.base_gx = (ctx.base_gx * ctx.baseSamples + gx) / (ctx.baseSamples + 1);
-      ctx.base_gy = (ctx.base_gy * ctx.baseSamples + gy) / (ctx.baseSamples + 1);
-      ctx.base_gz = (ctx.base_gz * ctx.baseSamples + gz) / (ctx.baseSamples + 1);
-      ctx.baseSamples++;
-
-      if (isMonitoringUnlocked() && ctx.baseSamples >= FALL_CALIB_MIN_SAMPLES)
-      {
-        normalize(ctx.base_gx, ctx.base_gy, ctx.base_gz);
-        ctx.state = FallState::Monitoring;
-        ctx.monitoringSinceMs = nowMs;
-      }
-      break;
+      g_ledRing.setPixelColor(i, color);
     }
+    g_ledRing.show();
+  }
 
-    case FallState::Monitoring:
-      if (nowMs - ctx.monitoringSinceMs >= FALL_IMPACT_COOLDOWN_MS && accelMag >= FALL_IMPACT_THRESHOLD_G)
-      {
-        ctx.impactDetectedMs = nowMs;
-        ctx.tiltStartMs = 0;
-        ctx.exitStableStartMs = 0;
-        ctx.state = FallState::PostImpact;
-        Serial.printf("[FALL] Impact detected |a|=%.2fg\n", accelMag);
-      }
-      break;
-
-    case FallState::PostImpact:
+  uint32_t colorWheel(uint16_t pos)
+  {
+    pos = 255 - pos;
+    if (pos < 85)
     {
-      if (tiltDeg >= FALL_TILT_ENTER_DEG)
-      {
-        if (ctx.tiltStartMs == 0)
-        {
-          ctx.tiltStartMs = nowMs;
-        }
-        if (nowMs - ctx.tiltStartMs >= FALL_TILT_HOLD_MS)
-        {
-          ctx.state = FallState::FallDetected;
-          ctx.fellTimeMs = nowMs;
-          ctx.uprightStartMs = 0;
-          reading.fallTriggered = !ctx.alertIssued;
-          ctx.alertIssued = true;
-          Serial.printf("[FALL] Tilt %.1f deg -> FALL DETECTED\n", tiltDeg);
-        }
-      }
-      else
-      {
-        ctx.tiltStartMs = 0;
-      }
-
-      if (tiltDeg < FALL_TILT_EXIT_DEG)
-      {
-        if (ctx.exitStableStartMs == 0)
-        {
-          ctx.exitStableStartMs = nowMs;
-        }
-        if (nowMs - ctx.exitStableStartMs > FALL_EXIT_STABLE_MS)
-        {
-          ctx.state = FallState::Monitoring;
-          ctx.monitoringSinceMs = nowMs;
-          ctx.tiltStartMs = 0;
-          ctx.exitStableStartMs = 0;
-        }
-      }
-      else
-      {
-        ctx.exitStableStartMs = 0;
-      }
-
-      if (nowMs - ctx.impactDetectedMs > FALL_POST_WINDOW_MS && ctx.state != FallState::FallDetected)
-      {
-        ctx.state = FallState::Monitoring;
-        ctx.monitoringSinceMs = nowMs;
-        ctx.tiltStartMs = 0;
-      }
-
-      break;
+      return g_ledRing.Color(255 - pos * 3, 0, pos * 3);
     }
-
-    case FallState::FallDetected:
+    if (pos < 170)
     {
-      bool minLockSatisfied = (nowMs - ctx.fellTimeMs) > FALL_MIN_LOCK_MS;
-      if (tiltDeg < FALL_UPRIGHT_DEG)
-      {
-        if (ctx.uprightStartMs == 0)
-        {
-          ctx.uprightStartMs = nowMs;
-        }
-        if (minLockSatisfied && (nowMs - ctx.uprightStartMs) > FALL_UPRIGHT_HOLD_MS)
-        {
-          ctx.state = FallState::Monitoring;
-          ctx.monitoringSinceMs = nowMs;
-          ctx.fellTimeMs = 0;
-          ctx.uprightStartMs = 0;
-          ctx.alertIssued = false;
-          reading.fallRecovered = true;
-          Serial.println("[FALL] Upright posture restored -> monitoring");
-        }
-      }
-      else
-      {
-        ctx.uprightStartMs = 0;
-      }
-      break;
+      pos -= 85;
+      return g_ledRing.Color(0, pos * 3, 255 - pos * 3);
     }
-    }
+    pos -= 170;
+    return g_ledRing.Color(pos * 3, 255 - pos * 3, 0);
+  }
 
-    reading.state = ctx.state;
-    return reading;
+  void renderModeCycling(unsigned long nowMs)
+  {
+    clearRing();
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
+    {
+      uint16_t wheelPos = static_cast<uint16_t>((i * 256 / LED_RING_COUNT) + (nowMs / 8));
+      g_ledRing.setPixelColor(i, colorWheel(wheelPos & 0xFF));
+    }
+    g_ledRing.show();
+  }
+
+  void renderSpeechListening(unsigned long nowMs)
+  {
+    clearRing();
+    const uint16_t head = static_cast<uint16_t>((nowMs / 140) % LED_RING_COUNT);
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
+    {
+      float scale = 0.05f;
+      uint16_t dist = (head + LED_RING_COUNT - i) % LED_RING_COUNT;
+      if (dist == 0)
+      {
+        scale = 1.0f;
+      }
+      else if (dist == 1 || dist == LED_RING_COUNT - 1)
+      {
+        scale = 0.35f;
+      }
+      g_ledRing.setPixelColor(i, scaleColor(g_ledRing.Color(40, 120, 255), scale));
+    }
+    g_ledRing.show();
+  }
+
+  void renderSpeechSpeaking(unsigned long nowMs)
+  {
+    clearRing();
+    const float phase = (nowMs % 1200) / 1200.0f;
+    const float pulse = 0.6f + 0.4f * sinf(phase * 2.0f * static_cast<float>(M_PI));
+    const uint32_t color = scaleColor(g_ledRing.Color(255, 255, 255), pulse);
+    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
+    {
+      g_ledRing.setPixelColor(i, color);
+    }
+    g_ledRing.show();
   }
 
   void sensorTask(void *param)
   {
-    auto *args = static_cast<SensorTaskArgs *>(param);
-    TelemetryClient *client = args ? args->client : nullptr;
+    (void)param;
 
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(400000); // fast mode if hardware supports it
+    Wire.setClock(400000);
 
-    g_ledRing.begin(); // Prepare the NeoPixel driver before any animations run.
-    g_ledRing.setBrightness(80);
-    g_ledRing.show(); // Clear residual pixels at boot.
+    g_ledRing.begin();
+    g_ledRing.setBrightness(LED_BRIGHTNESS);
+    g_ledRing.show();
 
-    FallContext fall{};
+    MotionContext ctx{};
+    ctx.present = scanMpuAddress(ctx);
 
-    fall.present = scanMpuAddress(fall);
-    if (fall.present)
+    if (ctx.present)
     {
-      writeMpuReg(fall.mpuAddr, 0x6B, 0x01); // wake up
-      writeMpuReg(fall.mpuAddr, 0x1C, 0x00); // ±2g
-      writeMpuReg(fall.mpuAddr, 0x1B, 0x08); // ±500 dps
-      writeMpuReg(fall.mpuAddr, 0x1A, 0x03); // DLPF
-      writeMpuReg(fall.mpuAddr, 0x19, 9);    // sample rate divider
-      fall.startCalibMs = millis();
-      fall.filteredX = 0.0f;
-      fall.filteredY = 0.0f;
-      fall.filteredZ = 1.0f;
-      Serial.print("[FALL] MPU6050 detected at 0x");
-      Serial.println(fall.mpuAddr, HEX);
+      writeMpuReg(ctx.mpuAddr, 0x6B, 0x01); // wake
+      writeMpuReg(ctx.mpuAddr, 0x1C, 0x00); // +/-2g accel
+      writeMpuReg(ctx.mpuAddr, 0x1B, 0x08); // gyro 500 dps
+      writeMpuReg(ctx.mpuAddr, 0x1A, 0x03); // DLPF
+      writeMpuReg(ctx.mpuAddr, 0x19, 9);    // sample divider
+      Serial.printf("[SENS] MPU6050 detected at 0x%02X\n", ctx.mpuAddr);
     }
     else
     {
-      Serial.println("[FALL][WARN] MPU6050 not found.");
+      Serial.println("[SENS][WARN] MPU6050 not detected. LED animations will fallback.");
     }
-
-    unsigned long lastStatusMs = 0;
 
     for (;;)
     {
-      unsigned long nowMs = millis();
-      FallReading fallReading = updateFallDetector(fall, nowMs);
-
-      renderLed(fall.state, nowMs, fallReading.tiltDeg, fall.alertIssued);
-
-      if (fallReading.fallTriggered && client)
+      const unsigned long nowMs = millis();
+      if (ctx.present)
       {
-        const String message = "[AUDIO] Fall detected";
-        Serial.println(message);
-        if (!client->queueAudioClip(FALL_ALERT_CLIP))
-        {
-          Serial.println("[AUDIO] Failed to queue fall alert clip");
-        }
+        updateMotion(ctx, nowMs);
       }
-      if (fallReading.fallRecovered && client)
-      {
-        const String message = "[AUDIO] Fall recovery detected";
-        Serial.println(message);
-        if (!client->queueAudioClip(FALL_CLEAR_CLIP))
-        {
-          Serial.println("[AUDIO] Failed to queue all-clear clip");
-        }
-      }
-
-      if (nowMs - lastStatusMs >= STATUS_PRINT_INTERVAL_MS)
-      {
-        lastStatusMs = nowMs;
-        Serial.print("[DATA] fall=");
-        Serial.print(fallStateToString(fall.state));
-        Serial.print(" tilt=");
-        if (fallReading.available && !isnan(fallReading.tiltDeg))
-        {
-          Serial.print(fallReading.tiltDeg, 1);
-          Serial.print("deg");
-        }
-        else
-        {
-          Serial.print("--");
-        }
-        Serial.println();
-      }
-
-      vTaskDelay(pdMS_TO_TICKS(SENSOR_LOOP_DELAY_MS));
+      updateState(ctx, nowMs);
+      renderState(ctx, nowMs);
+      vTaskDelay(pdMS_TO_TICKS(MOTION_LOOP_DELAY_MS));
     }
+  }
+
+  SpeechLedMode currentSpeechLedMode()
+  {
+    portENTER_CRITICAL(&g_speechMux);
+    SpeechLedMode mode = g_speechMode;
+    portEXIT_CRITICAL(&g_speechMux);
+    return mode;
+  }
+
+  void setSpeechLedMode(SpeechLedMode mode)
+  {
+    portENTER_CRITICAL(&g_speechMux);
+    g_speechMode = mode;
+    portEXIT_CRITICAL(&g_speechMux);
   }
 
 } // namespace
