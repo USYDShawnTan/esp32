@@ -1,11 +1,13 @@
 #pragma once
 
-#include "TelemetryClient.h"
+#include <stddef.h>
+
+class TelemetryClient;
 
 /**
- * Starts the background task that handles fall detection, LED status
- * rendering, and alert audio queueing. The TelemetryClient instance
- * must remain valid for the lifetime of the firmware.
+ * Starts the background task that manages motion-driven LED animations.
+ * The TelemetryClient pointer is kept for backwards compatibility with
+ * previous revisions and may be null.
  */
 void startSensorManagerTask(TelemetryClient *client);
 

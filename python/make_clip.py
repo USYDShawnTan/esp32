@@ -4,8 +4,8 @@ import os
 from deepgram import AsyncDeepgramClient
 from server import DATA_DIR, load_env_files
 
-CLIP_NAME = "alert_fall_detected.wav"
-PROMPT = "Warning. A fall has been detected. Please assist immediately."
+CLIP_NAME = "hearing.wav"
+PROMPT = "I'm Hearing now~ How can I assist you?"
 
 
 async def main() -> None:

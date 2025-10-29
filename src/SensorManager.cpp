@@ -36,12 +36,16 @@ namespace
   constexpr uint32_t ENERGY_DECAY_MS = 600;
   constexpr uint32_t OVERLOAD_DECAY_MS = 900;
 
-  constexpr float ANGLE_PICKUP_ENTER_DEG = 7.0f;
-  constexpr float ANGLE_PICKUP_EXIT_DEG = 3.0f;
-  constexpr float ANGLE_PICKUP_CONFIRM_DEG = 11.0f;
-  constexpr uint32_t PICKUP_MIN_DURATION_MS = 600;
-  constexpr uint32_t PUTDOWN_MIN_DURATION_MS = 800;
-  constexpr float LATERAL_ACCEL_EXIT = 0.15f;
+  constexpr float ANGLE_PICKUP_ENTER_DEG = 10.0f;
+  constexpr float ANGLE_PICKUP_EXIT_DEG = 4.0f;
+  constexpr float ANGLE_PICKUP_CONFIRM_DEG = 14.0f;
+  constexpr uint32_t PICKUP_MIN_DURATION_MS = 700;
+  constexpr uint32_t PUTDOWN_MIN_DURATION_MS = 900;
+  constexpr float PICKUP_MOTION_THRESHOLD = 0.16f;
+  constexpr uint32_t PICKUP_MOTION_MIN_MS = 350;
+  constexpr float PICKUP_ALONG_THRESHOLD = 0.14f;
+  constexpr uint32_t PICKUP_ALONG_MIN_MS = 350;
+  constexpr float PUTDOWN_ALONG_EXIT = 0.08f;
 
   enum class SystemState
   {
@@ -92,6 +96,10 @@ namespace
     float filteredLateral = 0.0f;
     bool pickupCandidate = false;
     unsigned long pickupCandidateStartMs = 0;
+    unsigned long pickupMotionStartMs = 0;
+    unsigned long pickupAlongStartMs = 0;
+    bool pickupMotionSatisfied = false;
+    bool pickupAlongSatisfied = false;
     unsigned long lastDebugPrintMs = 0;
   };
 
@@ -291,12 +299,15 @@ namespace
     const bool angleActive = ctx.filteredAngle > ANGLE_PICKUP_ENTER_DEG;
     const bool angleConfirm = ctx.filteredAngle > ANGLE_PICKUP_CONFIRM_DEG;
     const bool angleIdle = ctx.filteredAngle < ANGLE_PICKUP_EXIT_DEG;
-    const bool lateralIdle = ctx.filteredLateral < LATERAL_ACCEL_EXIT;
-
+    const bool motionHigh = ctx.filteredMotion > PICKUP_MOTION_THRESHOLD;
+    const bool motionCalm = ctx.filteredMotion < (PICKUP_MOTION_THRESHOLD * 0.5f);
+    const float absAlong = fabsf(along);
+    const bool alongHigh = absAlong > PICKUP_ALONG_THRESHOLD;
+    const bool alongCalm = absAlong < PUTDOWN_ALONG_EXIT;
     const bool pickupSignal = angleActive;
     const bool pickupConfirmed = angleConfirm;
-    const bool pickupReset = angleIdle && lateralIdle;
-    const bool putdownSignal = pickupReset && motionIdle;
+    const bool pickupReset = !angleActive && motionCalm && alongCalm;
+    const bool putdownSignal = angleIdle && motionIdle && alongCalm;
 
     if (!ctx.inHand)
     {
@@ -306,27 +317,93 @@ namespace
         {
           ctx.pickupCandidate = true;
           ctx.pickupCandidateStartMs = nowMs;
+          ctx.pickupMotionStartMs = motionHigh ? nowMs : 0;
+          ctx.pickupAlongStartMs = alongHigh ? nowMs : 0;
+          ctx.pickupMotionSatisfied = false;
+          ctx.pickupAlongSatisfied = false;
         }
-        else if (pickupConfirmed && (nowMs - ctx.pickupCandidateStartMs) >= PICKUP_MIN_DURATION_MS)
+        else
         {
-          ctx.inHand = true;
-          ctx.pickupCandidate = false;
-          ctx.pickupCandidateStartMs = 0;
-          ctx.putdownCandidate = false;
-          ctx.putdownCandidateStartMs = 0;
-          Serial.println("[SENS] Pickup confirmed -> Ready");
+          if (motionHigh)
+          {
+            if (ctx.pickupMotionStartMs == 0)
+            {
+              ctx.pickupMotionStartMs = nowMs;
+            }
+            if (!ctx.pickupMotionSatisfied &&
+                (nowMs - ctx.pickupMotionStartMs) >= PICKUP_MOTION_MIN_MS)
+            {
+              ctx.pickupMotionSatisfied = true;
+              ctx.pickupMotionStartMs = 0;
+            }
+          }
+          else
+          {
+            if (!ctx.pickupMotionSatisfied)
+            {
+              ctx.pickupMotionStartMs = 0;
+            }
+          }
+
+          if (alongHigh)
+          {
+            if (ctx.pickupAlongStartMs == 0)
+            {
+              ctx.pickupAlongStartMs = nowMs;
+            }
+            if (!ctx.pickupAlongSatisfied &&
+                (nowMs - ctx.pickupAlongStartMs) >= PICKUP_ALONG_MIN_MS)
+            {
+              ctx.pickupAlongSatisfied = true;
+              ctx.pickupAlongStartMs = 0;
+            }
+          }
+          else
+          {
+            if (!ctx.pickupAlongSatisfied)
+            {
+              ctx.pickupAlongStartMs = 0;
+            }
+          }
+
+          const bool motionHoldSatisfied = ctx.pickupMotionSatisfied;
+          const bool alongHoldSatisfied = ctx.pickupAlongSatisfied;
+          const bool durationSatisfied = (nowMs - ctx.pickupCandidateStartMs) >= PICKUP_MIN_DURATION_MS;
+          const bool accelerationSatisfied = motionHoldSatisfied || alongHoldSatisfied;
+
+          if (pickupConfirmed && durationSatisfied && accelerationSatisfied)
+          {
+            ctx.inHand = true;
+            ctx.pickupCandidate = false;
+            ctx.pickupCandidateStartMs = 0;
+            ctx.pickupMotionStartMs = 0;
+            ctx.pickupAlongStartMs = 0;
+            ctx.pickupMotionSatisfied = false;
+            ctx.pickupAlongSatisfied = false;
+            ctx.putdownCandidate = false;
+            ctx.putdownCandidateStartMs = 0;
+            Serial.println("[SENS] Pickup confirmed -> Ready");
+          }
         }
       }
       else if (pickupReset)
       {
         ctx.pickupCandidate = false;
         ctx.pickupCandidateStartMs = 0;
+        ctx.pickupMotionStartMs = 0;
+        ctx.pickupAlongStartMs = 0;
+        ctx.pickupMotionSatisfied = false;
+        ctx.pickupAlongSatisfied = false;
       }
     }
     else
     {
       ctx.pickupCandidate = false;
       ctx.pickupCandidateStartMs = 0;
+      ctx.pickupMotionStartMs = 0;
+      ctx.pickupAlongStartMs = 0;
+      ctx.pickupMotionSatisfied = false;
+      ctx.pickupAlongSatisfied = false;
 
       if (putdownSignal)
       {
@@ -376,9 +453,13 @@ namespace
       {
         ctx.lastDebugPrintMs = nowMs;
         const unsigned long pickMs = ctx.pickupCandidate ? (nowMs - ctx.pickupCandidateStartMs) : 0;
+        const unsigned long pickMotionMs = ctx.pickupMotionStartMs ? (nowMs - ctx.pickupMotionStartMs) : 0;
+        const unsigned long pickAlongMs = ctx.pickupAlongStartMs ? (nowMs - ctx.pickupAlongStartMs) : 0;
+        const bool motionSatisfied = ctx.pickupMotionSatisfied;
+        const bool alongSatisfied = ctx.pickupAlongSatisfied;
         const unsigned long putMs = ctx.putdownCandidate ? (nowMs - ctx.putdownCandidateStartMs) : 0;
         Serial.printf(
-            "[SENS][DBG] ax=%.3f ay=%.3f az=%.3f | |a|=%.3f motion=%.3f angle=%.1f | lat=%.3f along=%.3f inHand=%d pick=%d(%lu) put=%d(%lu)\n",
+            "[SENS][DBG] ax=%.3f ay=%.3f az=%.3f | |a|=%.3f motion=%.3f angle=%.1f | lat=%.3f along=%.3f inHand=%d pick=%d(%lu/%lu/%lu|%d%d) put=%d(%lu)\n",
             ax,
             ay,
             az,
@@ -390,6 +471,10 @@ namespace
             ctx.inHand ? 1 : 0,
             ctx.pickupCandidate ? 1 : 0,
             pickMs,
+            pickMotionMs,
+            pickAlongMs,
+            motionSatisfied ? 1 : 0,
+            alongSatisfied ? 1 : 0,
             ctx.putdownCandidate ? 1 : 0,
             putMs);
       }
@@ -437,13 +522,7 @@ namespace
       return;
     }
 
-    if (ctx.filteredMotion < MOTION_IDLE_THRESHOLD)
-    {
-      ctx.state = SystemState::Idle;
-      return;
-    }
-
-    ctx.state = SystemState::Ready;
+    ctx.state = SystemState::Idle;
   }
 
   uint32_t scaleColor(uint32_t color, float scale)
