@@ -1,11 +1,12 @@
 #include "SensorManager.h"
 
-#include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <Wire.h>
 #include <math.h>
+
+#include "LedController.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -29,11 +30,7 @@ namespace
   constexpr uint32_t SENSOR_DEBUG_INTERVAL_MS = 250;
 
   constexpr float MOTION_IDLE_THRESHOLD = 0.05f;
-  constexpr float MOTION_ACTIVE_THRESHOLD = 0.18f;
-  constexpr float MOTION_WAVE_THRESHOLD = 0.42f;
   constexpr float MOTION_OVERLOAD_THRESHOLD = 0.75f;
-
-  constexpr uint32_t ENERGY_DECAY_MS = 600;
   constexpr uint32_t OVERLOAD_DECAY_MS = 900;
 
   constexpr float ANGLE_PICKUP_ENTER_DEG = 10.0f;
@@ -52,16 +49,7 @@ namespace
     Initializing,
     Idle,
     Ready,
-    EnergyWave,
-    Overload,
-    ModeCycling
-  };
-
-  enum class SpeechLedMode
-  {
-    None,
-    Listening,
-    Speaking
+    Overload
   };
 
   struct MotionContext
@@ -82,9 +70,7 @@ namespace
     float filteredMotion = 0.0f;
     float filteredAngle = 0.0f;
 
-    bool energyActive = false;
     bool overloadActive = false;
-    unsigned long lastEnergyMs = 0;
     unsigned long lastOverloadMs = 0;
 
     SystemState state = SystemState::Initializing;
@@ -103,12 +89,6 @@ namespace
     unsigned long lastDebugPrintMs = 0;
   };
 
-  Adafruit_NeoPixel g_ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
-
-  portMUX_TYPE g_speechMux = portMUX_INITIALIZER_UNLOCKED;
-  SpeechLedMode g_speechMode = SpeechLedMode::None;
-  bool g_modeCycleRequest = false;
-
   // Forward declarations
   bool scanMpuAddress(MotionContext &ctx);
   bool writeMpuReg(uint8_t addr, uint8_t reg, uint8_t value);
@@ -123,15 +103,11 @@ namespace
   void renderInitializing(unsigned long nowMs);
   void renderIdle(unsigned long nowMs);
   void renderReady(unsigned long nowMs);
-  void renderEnergyWave(unsigned long nowMs);
   void renderOverload(unsigned long nowMs);
-  void renderModeCycling(unsigned long nowMs);
   void renderSpeechListening(unsigned long nowMs);
   void renderSpeechSpeaking(unsigned long nowMs);
 
   void sensorTask(void *param);
-  SpeechLedMode currentSpeechLedMode();
-  void setSpeechLedMode(SpeechLedMode mode);
 } // namespace
 
 void startSensorManagerTask(TelemetryClient *client)
@@ -142,17 +118,17 @@ void startSensorManagerTask(TelemetryClient *client)
 
 void sensorManagerTriggerSpeechListening()
 {
-  setSpeechLedMode(SpeechLedMode::Listening);
+  ledControllerSetSpeechMode(SpeechLedMode::Listening);
 }
 
 void sensorManagerTriggerSpeechSpeaking()
 {
-  setSpeechLedMode(SpeechLedMode::Speaking);
+  ledControllerSetSpeechMode(SpeechLedMode::Speaking);
 }
 
 void sensorManagerClearSpeechOverride()
 {
-  setSpeechLedMode(SpeechLedMode::None);
+  ledControllerSetSpeechMode(SpeechLedMode::None);
 }
 
 void sensorManagerUnlockMonitoring()
@@ -427,22 +403,12 @@ namespace
       }
     }
 
-    if (ctx.filteredMotion > MOTION_WAVE_THRESHOLD)
-    {
-      ctx.energyActive = true;
-      ctx.lastEnergyMs = nowMs;
-    }
-    else if (ctx.energyActive && nowMs - ctx.lastEnergyMs > ENERGY_DECAY_MS && ctx.filteredMotion < MOTION_ACTIVE_THRESHOLD)
-    {
-      ctx.energyActive = false;
-    }
-
     if (ctx.filteredMotion > MOTION_OVERLOAD_THRESHOLD)
     {
       ctx.overloadActive = true;
       ctx.lastOverloadMs = nowMs;
     }
-    else if (ctx.overloadActive && nowMs - ctx.lastOverloadMs > OVERLOAD_DECAY_MS && ctx.filteredMotion < MOTION_ACTIVE_THRESHOLD)
+    else if (ctx.overloadActive && nowMs - ctx.lastOverloadMs > OVERLOAD_DECAY_MS && ctx.filteredMotion < MOTION_IDLE_THRESHOLD)
     {
       ctx.overloadActive = false;
     }
@@ -494,25 +460,9 @@ namespace
       return;
     }
 
-    if (g_modeCycleRequest)
-    {
-      ctx.state = SystemState::ModeCycling;
-      if (nowMs - ctx.lastEnergyMs > 1200)
-      {
-        g_modeCycleRequest = false;
-      }
-      return;
-    }
-
     if (ctx.overloadActive)
     {
       ctx.state = SystemState::Overload;
-      return;
-    }
-
-    if (ctx.energyActive && ctx.filteredMotion > MOTION_ACTIVE_THRESHOLD)
-    {
-      ctx.state = SystemState::EnergyWave;
       return;
     }
 
@@ -525,195 +475,37 @@ namespace
     ctx.state = SystemState::Idle;
   }
 
-  uint32_t scaleColor(uint32_t color, float scale)
-  {
-    scale = fmaxf(0.0f, fminf(scale, 1.0f));
-    uint8_t r = static_cast<uint8_t>((color >> 16) & 0xFF);
-    uint8_t g = static_cast<uint8_t>((color >> 8) & 0xFF);
-    uint8_t b = static_cast<uint8_t>(color & 0xFF);
-    r = static_cast<uint8_t>(r * scale);
-    g = static_cast<uint8_t>(g * scale);
-    b = static_cast<uint8_t>(b * scale);
-    return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | b;
-  }
-
-  void clearRing()
-  {
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      g_ledRing.setPixelColor(i, 0);
-    }
-  }
-
   void renderState(const MotionContext &ctx, unsigned long nowMs)
   {
-    SpeechLedMode speechMode = currentSpeechLedMode();
+    SpeechLedMode speechMode = ledControllerCurrentSpeechMode();
     if (speechMode == SpeechLedMode::Speaking)
     {
-      renderSpeechSpeaking(nowMs);
+      ledControllerRenderSpeechSpeaking(nowMs);
       return;
     }
     if (speechMode == SpeechLedMode::Listening)
     {
-      renderSpeechListening(nowMs);
+      ledControllerRenderSpeechListening(nowMs);
       return;
     }
 
+    LedScene scene = LedScene::Idle;
     switch (ctx.state)
     {
     case SystemState::Initializing:
-      renderInitializing(nowMs);
+      scene = LedScene::Initializing;
       break;
     case SystemState::Idle:
-      renderIdle(nowMs);
+      scene = LedScene::Idle;
       break;
     case SystemState::Ready:
-      renderReady(nowMs);
-      break;
-    case SystemState::EnergyWave:
-      renderEnergyWave(nowMs);
+      scene = LedScene::Ready;
       break;
     case SystemState::Overload:
-      renderOverload(nowMs);
-      break;
-    case SystemState::ModeCycling:
-      renderModeCycling(nowMs);
+      scene = LedScene::Overload;
       break;
     }
-  }
-
-  void renderInitializing(unsigned long nowMs)
-  {
-    clearRing();
-    const float progress = fmodf(nowMs / 10.0f, static_cast<float>(LED_RING_COUNT));
-    const uint16_t lead = static_cast<uint16_t>(progress);
-    for (uint16_t i = 0; i <= lead && i < LED_RING_COUNT; ++i)
-    {
-      float scale = 0.2f + (static_cast<float>(i) / LED_RING_COUNT) * 0.8f;
-      g_ledRing.setPixelColor(i, scaleColor(g_ledRing.Color(0, 0, 80), scale));
-    }
-    g_ledRing.show();
-  }
-
-  void renderIdle(unsigned long nowMs)
-  {
-    clearRing();
-    const float phase = (nowMs % 4000) / 4000.0f;
-    const float wave = 0.5f + 0.5f * sinf(phase * 2.0f * static_cast<float>(M_PI));
-    uint32_t color = g_ledRing.Color(0, 0, 180);
-    color = scaleColor(color, 0.25f + 0.75f * wave);
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      g_ledRing.setPixelColor(i, color);
-    }
-    g_ledRing.show();
-  }
-
-  void renderReady(unsigned long nowMs)
-  {
-    clearRing();
-    const uint16_t index = static_cast<uint16_t>((nowMs / 120) % LED_RING_COUNT);
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      float scale = 0.05f;
-      int16_t diff = static_cast<int16_t>((i + LED_RING_COUNT) - index) % LED_RING_COUNT;
-      if (diff == 0)
-      {
-        scale = 1.0f;
-      }
-      else if (diff == 1 || diff == -1)
-      {
-        scale = 0.25f;
-      }
-      g_ledRing.setPixelColor(i, scaleColor(g_ledRing.Color(120, 120, 120), scale));
-    }
-    g_ledRing.show();
-  }
-
-  void renderEnergyWave(unsigned long nowMs)
-  {
-    clearRing();
-    const float phase = (nowMs % 1600) / 1600.0f;
-    const float pulse = 0.4f + 0.6f * sinf(phase * 2.0f * static_cast<float>(M_PI));
-    const uint32_t color = scaleColor(g_ledRing.Color(255, 120, 0), pulse);
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      g_ledRing.setPixelColor(i, color);
-    }
-    g_ledRing.show();
-  }
-
-  void renderOverload(unsigned long nowMs)
-  {
-    clearRing();
-    const bool on = (nowMs / 120) % 2 == 0;
-    const uint32_t color = on ? g_ledRing.Color(255, 0, 0) : 0;
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      g_ledRing.setPixelColor(i, color);
-    }
-    g_ledRing.show();
-  }
-
-  uint32_t colorWheel(uint16_t pos)
-  {
-    pos = 255 - pos;
-    if (pos < 85)
-    {
-      return g_ledRing.Color(255 - pos * 3, 0, pos * 3);
-    }
-    if (pos < 170)
-    {
-      pos -= 85;
-      return g_ledRing.Color(0, pos * 3, 255 - pos * 3);
-    }
-    pos -= 170;
-    return g_ledRing.Color(pos * 3, 255 - pos * 3, 0);
-  }
-
-  void renderModeCycling(unsigned long nowMs)
-  {
-    clearRing();
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      uint16_t wheelPos = static_cast<uint16_t>((i * 256 / LED_RING_COUNT) + (nowMs / 8));
-      g_ledRing.setPixelColor(i, colorWheel(wheelPos & 0xFF));
-    }
-    g_ledRing.show();
-  }
-
-  void renderSpeechListening(unsigned long nowMs)
-  {
-    clearRing();
-    const uint16_t head = static_cast<uint16_t>((nowMs / 140) % LED_RING_COUNT);
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      float scale = 0.05f;
-      uint16_t dist = (head + LED_RING_COUNT - i) % LED_RING_COUNT;
-      if (dist == 0)
-      {
-        scale = 1.0f;
-      }
-      else if (dist == 1 || dist == LED_RING_COUNT - 1)
-      {
-        scale = 0.35f;
-      }
-      g_ledRing.setPixelColor(i, scaleColor(g_ledRing.Color(40, 120, 255), scale));
-    }
-    g_ledRing.show();
-  }
-
-  void renderSpeechSpeaking(unsigned long nowMs)
-  {
-    clearRing();
-    const float phase = (nowMs % 1200) / 1200.0f;
-    const float pulse = 0.6f + 0.4f * sinf(phase * 2.0f * static_cast<float>(M_PI));
-    const uint32_t color = scaleColor(g_ledRing.Color(255, 255, 255), pulse);
-    for (uint16_t i = 0; i < LED_RING_COUNT; ++i)
-    {
-      g_ledRing.setPixelColor(i, color);
-    }
-    g_ledRing.show();
+    ledControllerRenderScene(scene, nowMs);
   }
 
   void sensorTask(void *param)
@@ -723,9 +515,7 @@ namespace
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(400000);
 
-    g_ledRing.begin();
-    g_ledRing.setBrightness(LED_BRIGHTNESS);
-    g_ledRing.show();
+    ledControllerInit(LED_RING_PIN, LED_RING_COUNT, LED_BRIGHTNESS);
 
     MotionContext ctx{};
     ctx.present = scanMpuAddress(ctx);
@@ -755,21 +545,6 @@ namespace
       renderState(ctx, nowMs);
       vTaskDelay(pdMS_TO_TICKS(MOTION_LOOP_DELAY_MS));
     }
-  }
-
-  SpeechLedMode currentSpeechLedMode()
-  {
-    portENTER_CRITICAL(&g_speechMux);
-    SpeechLedMode mode = g_speechMode;
-    portEXIT_CRITICAL(&g_speechMux);
-    return mode;
-  }
-
-  void setSpeechLedMode(SpeechLedMode mode)
-  {
-    portENTER_CRITICAL(&g_speechMux);
-    g_speechMode = mode;
-    portEXIT_CRITICAL(&g_speechMux);
   }
 
 } // namespace
