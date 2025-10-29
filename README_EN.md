@@ -2,12 +2,12 @@
 [中文版说明](README.md)
 
 ## Overview
-This project combines an ESP32-based audio bridge with a multi-sensor telemetry stack and a Python backend that integrates with the Deepgram Agent API. The firmware streams microphone audio over Wi-Fi, plays remote WAV clips through an I2S amplifier, and gathers fall detection, heart-rate/SpO₂, and temperature data. The Python server relays audio to Deepgram, injects fresh telemetry into the dialogue, and exposes HTTP endpoints for logs, events, and audio commands.
+This project combines an ESP32-based audio bridge with a fall-detection telemetry pipeline and a Python backend that integrates with the Deepgram Agent API. The firmware streams microphone audio over Wi-Fi, plays remote WAV clips through an I2S amplifier, and gathers MPU6050 fall detection data. The Python server relays audio to Deepgram, injects telemetry into the dialogue, and exposes HTTP endpoints for logs, events, and audio commands.
 
 ## Key Features
 - **Full-duplex audio bridge**: The ESP32 pushes PCM frames from an INMP441 microphone while automatically pausing uploads during local WAV playback to avoid feedback.
 - **Download-and-play queue**: The Python server can enqueue clips (local or remote URLs); the ESP32 downloads, plays, and unmutes the microphone once playback ends.
-- **Sensor suite**: Built-in support for MPU6050 fall detection, MAX30102 heart-rate/SpO2, and auto-detected temperature sensors (MAX30205/LM75/TMP102).
+- **Fall detection**: Built-in MPU6050 processing detects impacts and sustained tilt, publishing alerts to the backend.
 - **NeoPixel status ring**: Visual states for calibration, monitoring, fall alerts, and speech listening/speaking overrides.
 - **Telemetry & logging**: The firmware periodically posts JSON telemetry and log events to the Python backend; the backend keeps the latest snapshot and shares it with the voice agent on demand.
 
@@ -20,7 +20,7 @@ This project combines an ESP32-based audio bridge with a multi-sensor telemetry 
 │  └─make_clip.py     Utility to assemble WAV test clips
 ├─src/
 │  ├─main.cpp         ESP32 audio bridge entry point
-│  └─SensorManager.cpp  Fall/vitals/temperature logic + LED rendering
+│  └─SensorManager.cpp  Fall detection logic + LED rendering
 ├─platformio.ini      PlatformIO project definition
 ├─README.md           Chinese documentation
 └─README_EN.md        English documentation
@@ -30,7 +30,7 @@ This project combines an ESP32-based audio bridge with a multi-sensor telemetry 
 ### 1. Hardware
 - FireBeetle 2 ESP32-E (or compatible ESP32 board)
 - INMP441 I2S microphone, MAX98357A I2S DAC/amplifier
-- MPU6050 IMU, MAX30102 pulse-oximeter, I²C temperature sensor
+- MPU6050 IMU for fall detection
 - 16-pixel NeoPixel ring (data pin defaults to GPIO 4)
 
 ### 2. Firmware (PlatformIO)
@@ -56,7 +56,7 @@ This project combines an ESP32-based audio bridge with a multi-sensor telemetry 
 
 ### 4. Deepgram Agent Flow
 - The backend establishes an Agent socket and manages turn-taking—microphone uploads pause while the agent speaks.
-- Every 10 seconds the server refreshes the agent prompt with the most recent sensor readings (or fallback values if telemetry is stale), so questions like "What's my heart rate?" return contextual answers.
+- The server periodically refreshes the agent prompt with the most recent fall status so follow-up questions stay grounded in live data.
 - Agent replies are stored in `python/data/agent-output.wav` and played back over the ESP32 speaker.
 
 ## LED Status Cheat Sheet
@@ -68,15 +68,14 @@ This project combines an ESP32-based audio bridge with a multi-sensor telemetry 
 - **Speech Speaking**: soft white breathing during playback
 
 ## API Endpoints
-- `POST /api/devices/{deviceId}/telemetry` – ingest telemetry (fall, vitals, temperature)
+- `POST /api/devices/{deviceId}/telemetry` – ingest fall-detection telemetry
 - `POST /api/audio/play` – queue a clip (`{"clip": "...wav"}` or `{"url": "..."}`) for the ESP32
 - `POST /api/audio/playback_done` – called by the firmware after playback to resume mic streaming immediately
 - `GET /api/devices` – fetch latest telemetry snapshot, alerts, and bridge status
 
 ## Troubleshooting
 - **Mic resumes too late** – confirm the ESP32 can reach `/api/audio/playback_done`; firewall or base URL issues will force the fallback timer.
-- **Negative temperature / nonsense vitals** – the server clamps out-of-range readings and substitutes nominal values; inspect sensor wiring or calibration if problems persist.
-- **Agent refuses telemetry questions** – ensure the backend logs show “[Vitals] Prompt refreshed …”. Missing Deepgram credentials or connectivity issues will stop the periodic prompt updates.
+- **Agent ignores fall updates** – check the backend logs or the `/api/devices` endpoint to verify telemetry is arriving; missing Deepgram credentials or connectivity issues will prevent updates from reaching the agent.
 
 ## Contributing
 Issues and pull requests are welcome. Please coordinate larger changes so the firmware and Python backend evolve together.

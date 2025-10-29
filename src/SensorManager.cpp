@@ -11,12 +11,6 @@
 #define I2C_BUFFER_LENGTH 128
 #endif
 
-#include "MAX30105.h"
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#include "spo2_algorithm.h"
-#pragma GCC diagnostic pop
-
 #include "TelemetryClient.h"
 #include "TelemetryPayloadBuilder.h"
 
@@ -47,17 +41,6 @@ constexpr unsigned long FALL_IMPACT_COOLDOWN_MS = 1500;
 
 constexpr const char *FALL_ALERT_CLIP = "alert_fall_detected.wav";
 constexpr const char *FALL_CLEAR_CLIP = "status_all_clear.wav";
-
-// Temperature calibration (reuse definitions from prior sketches)
-#ifndef TEMP_CALIB_SCALE
-#define TEMP_CALIB_SCALE 1.000f
-#endif
-#ifndef TEMP_CALIB_OFFSET
-#define TEMP_CALIB_OFFSET 3.80f
-#endif
-#ifndef TEMP_EMA_ALPHA
-#define TEMP_EMA_ALPHA 0.30f
-#endif
 
 enum class FallState
 {
@@ -104,55 +87,8 @@ struct FallReading
   bool fallRecovered = false;
 };
 
-enum class TemperatureSensorType
-{
-  Unknown,
-  MAX30205,
-  LM75,
-  TMP102
-};
-
-struct TemperatureContext
-{
-  TemperatureSensorType type = TemperatureSensorType::Unknown;
-  bool present = false;
-  float emaValueC = NAN;
-  unsigned long lastReadMs = 0;
-};
-
-struct TemperatureReading
-{
-  bool available = false;
-  float valueC = NAN;
-  String status;
-};
-
-struct VitalsContext
-{
-  bool present = false;
-  uint32_t irBuffer[100] = {};
-  uint32_t redBuffer[100] = {};
-  uint8_t index = 0;
-  bool ready = false;
-  unsigned long lastCalcMs = 0;
-  int32_t spo2 = -1;
-  int8_t spo2Valid = 0;
-  int32_t heartRate = -1;
-  int8_t heartRateValid = 0;
-};
-
-struct VitalsReading
-{
-  bool available = false;
-  int heartRate = 0;
-  bool heartRateValid = false;
-  int spo2 = 0;
-  bool spo2Valid = false;
-};
-
 // Central LED ring instance used to convey sensor and fall-detection states.
 Adafruit_NeoPixel g_ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
-MAX30105 g_maxSensor;
 TelemetryClient *g_client = nullptr;
 
 enum class SpeechLedMode
@@ -172,9 +108,6 @@ bool readAccelG(const FallContext &ctx, float &ax_g, float &ay_g, float &az_g);
 float angleDeg(float ax, float ay, float az, float bx, float by, float bz);
 void normalize(float &x, float &y, float &z);
 
-TemperatureSensorType detectTempSensor();
-float readTemperatureC(TemperatureSensorType type);
-
 const char *fallStateToString(FallState state);
 void renderLed(FallState state, unsigned long nowMs, float tiltDeg, bool fallAlertActive);
 void renderSpeechListeningEffect(unsigned long nowMs);
@@ -184,8 +117,6 @@ void setSpeechLedMode(SpeechLedMode mode);
 SpeechLedMode currentSpeechLedMode();
 
 FallReading updateFallDetector(FallContext &ctx, unsigned long nowMs);
-TemperatureReading updateTemperature(TemperatureContext &ctx, unsigned long nowMs);
-VitalsReading updateVitals(VitalsContext &ctx, unsigned long nowMs);
 
 void sensorTask(void *param);
 
@@ -288,79 +219,6 @@ float angleDeg(float ax, float ay, float az, float bx, float by, float bz)
   float dot = ax * bx + ay * by + az * bz;
   dot = fmaxf(-1.0f, fminf(1.0f, dot));
   return acosf(dot) * 180.0f / PI;
-}
-
-TemperatureSensorType detectTempSensor()
-{
-  constexpr uint8_t TEMP_I2C_ADDR = 0x48;
-  Wire.beginTransmission(TEMP_I2C_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission(false) != 0)
-  {
-    return TemperatureSensorType::Unknown;
-  }
-  if (Wire.requestFrom(TEMP_I2C_ADDR, static_cast<uint8_t>(2)) < 2)
-  {
-    return TemperatureSensorType::Unknown;
-  }
-  uint8_t msb = Wire.read();
-  uint8_t lsb = Wire.read();
-  uint16_t raw = (static_cast<uint16_t>(msb) << 8) | lsb;
-  if ((raw & 0x00FF) == 0)
-  {
-    return TemperatureSensorType::LM75;
-  }
-  if ((raw & 0x000F) == 0)
-  {
-    return TemperatureSensorType::TMP102;
-  }
-  return TemperatureSensorType::MAX30205;
-}
-
-float decodeTemperature(TemperatureSensorType type, uint16_t raw)
-{
-  switch (type)
-  {
-  case TemperatureSensorType::MAX30205:
-    return static_cast<int16_t>(raw) / 256.0f;
-  case TemperatureSensorType::LM75:
-  {
-    int16_t val = static_cast<int16_t>(raw);
-    val >>= 7;
-    return val * 0.5f;
-  }
-  case TemperatureSensorType::TMP102:
-  {
-    int16_t val = static_cast<int16_t>(raw);
-    val >>= 4;
-    return val * 0.0625f;
-  }
-  default:
-    return NAN;
-  }
-}
-
-float readTemperatureC(TemperatureSensorType type)
-{
-  if (type == TemperatureSensorType::Unknown)
-  {
-    return NAN;
-  }
-  constexpr uint8_t TEMP_I2C_ADDR = 0x48;
-  Wire.beginTransmission(TEMP_I2C_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission(false) != 0)
-  {
-    return NAN;
-  }
-  if (Wire.requestFrom(TEMP_I2C_ADDR, static_cast<uint8_t>(2)) < 2)
-  {
-    return NAN;
-  }
-  uint8_t msb = Wire.read();
-  uint8_t lsb = Wire.read();
-  uint16_t raw = (static_cast<uint16_t>(msb) << 8) | lsb;
-  return decodeTemperature(type, raw);
 }
 
 const char *fallStateToString(FallState state)
@@ -616,109 +474,6 @@ FallReading updateFallDetector(FallContext &ctx, unsigned long nowMs)
   return reading;
 }
 
-TemperatureReading updateTemperature(TemperatureContext &ctx, unsigned long nowMs)
-{
-  TemperatureReading reading{};
-  if (!ctx.present)
-  {
-    return reading;
-  }
-  if (nowMs - ctx.lastReadMs < 1000)
-  {
-    return reading;
-  }
-
-  ctx.lastReadMs = nowMs;
-  float raw = readTemperatureC(ctx.type);
-  if (isnan(raw))
-  {
-    return reading;
-  }
-
-  float calibrated = TEMP_CALIB_SCALE * raw + TEMP_CALIB_OFFSET;
-  if (isnan(ctx.emaValueC))
-  {
-    ctx.emaValueC = calibrated;
-  }
-  else
-  {
-    ctx.emaValueC = TEMP_EMA_ALPHA * calibrated + (1.0f - TEMP_EMA_ALPHA) * ctx.emaValueC;
-  }
-
-  reading.available = true;
-  reading.valueC = ctx.emaValueC;
-  if (ctx.emaValueC >= 38.0f)
-  {
-    reading.status = "high";
-  }
-  else if (ctx.emaValueC <= 35.0f)
-  {
-    reading.status = "low";
-  }
-  else
-  {
-    reading.status = "normal";
-  }
-  return reading;
-}
-
-VitalsReading updateVitals(VitalsContext &ctx, unsigned long nowMs)
-{
-  VitalsReading reading{};
-  if (!ctx.present)
-  {
-    return reading;
-  }
-
-  g_maxSensor.check();
-  while (g_maxSensor.available())
-  {
-    uint32_t red = g_maxSensor.getFIFORed();
-    uint32_t ir = g_maxSensor.getFIFOIR();
-    g_maxSensor.nextSample();
-
-    if (ctx.index < 100)
-    {
-      ctx.redBuffer[ctx.index] = red;
-      ctx.irBuffer[ctx.index] = ir;
-      ctx.index++;
-      if (ctx.index == 100)
-      {
-        ctx.ready = true;
-      }
-    }
-    else
-    {
-      for (uint8_t i = 25; i < 100; ++i)
-      {
-        ctx.redBuffer[i - 25] = ctx.redBuffer[i];
-        ctx.irBuffer[i - 25] = ctx.irBuffer[i];
-      }
-      ctx.redBuffer[75] = red;
-      ctx.irBuffer[75] = ir;
-      ctx.index = 76;
-    }
-  }
-
-  if (ctx.ready && (nowMs - ctx.lastCalcMs >= 250))
-  {
-    ctx.lastCalcMs = nowMs;
-    maxim_heart_rate_and_oxygen_saturation(
-        ctx.irBuffer, 100, ctx.redBuffer,
-        &ctx.spo2, &ctx.spo2Valid, &ctx.heartRate, &ctx.heartRateValid);
-  }
-
-  if (ctx.spo2Valid || ctx.heartRateValid)
-  {
-    reading.available = true;
-    reading.heartRate = ctx.heartRate;
-    reading.heartRateValid = ctx.heartRateValid;
-    reading.spo2 = ctx.spo2;
-    reading.spo2Valid = ctx.spo2Valid;
-  }
-  return reading;
-}
-
 void sensorTask(void *param)
 {
   auto *args = static_cast<SensorTaskArgs *>(param);
@@ -732,8 +487,6 @@ void sensorTask(void *param)
   g_ledRing.show();         // Clear residual pixels at boot.
 
   FallContext fall{};
-  TemperatureContext temp{};
-  VitalsContext vitals{};
 
   fall.present = scanMpuAddress(fall);
   if (fall.present)
@@ -757,55 +510,6 @@ void sensorTask(void *param)
     logMessage(client, "[FALL][WARN] MPU6050 not found");
   }
 
-  temp.type = detectTempSensor();
-  temp.present = (temp.type != TemperatureSensorType::Unknown);
-  if (temp.present)
-  {
-    switch (temp.type)
-    {
-    case TemperatureSensorType::MAX30205:
-      Serial.println("[TEMP] Detected MAX30205");
-      logMessage(client, "[TEMP] Detected MAX30205");
-      break;
-    case TemperatureSensorType::LM75:
-      Serial.println("[TEMP] Detected LM75");
-      logMessage(client, "[TEMP] Detected LM75");
-      break;
-    case TemperatureSensorType::TMP102:
-      Serial.println("[TEMP] Detected TMP102");
-      logMessage(client, "[TEMP] Detected TMP102");
-      break;
-    default:
-      break;
-    }
-  }
-  else
-  {
-    Serial.println("[TEMP][WARN] Sensor not found at 0x48");
-    logMessage(client, "[TEMP][WARN] Sensor not found");
-  }
-
-  vitals.present = g_maxSensor.begin(Wire, I2C_SPEED_FAST);
-  if (vitals.present)
-  {
-    byte ledBrightness = 0x7F;
-    byte sampleAverage = 4;
-    byte ledMode = 2;
-    byte sampleRate = 100;
-    int pulseWidth = 411;
-    int adcRange = 16384;
-    g_maxSensor.setup(ledBrightness, sampleAverage, ledMode,
-                      sampleRate, pulseWidth, adcRange);
-    g_maxSensor.setPulseAmplitudeGreen(0);
-    Serial.println("[HR] MAX30102 ready");
-    logMessage(client, "[HR] MAX30102 ready");
-  }
-  else
-  {
-    Serial.println("[HR][WARN] MAX30102 not responding at 0x57");
-    logMessage(client, "[HR][WARN] MAX30102 not responding");
-  }
-
   unsigned long lastTelemetryMs = 0;
   unsigned long lastStatusMs = 0;
 
@@ -813,8 +517,6 @@ void sensorTask(void *param)
   {
     unsigned long nowMs = millis();
     FallReading fallReading = updateFallDetector(fall, nowMs);
-    TemperatureReading tempReading = updateTemperature(temp, nowMs);
-    VitalsReading vitalsReading = updateVitals(vitals, nowMs);
 
     renderLed(fall.state, nowMs, fallReading.tiltDeg, fall.alertIssued);
 
@@ -859,28 +561,6 @@ void sensorTask(void *param)
         }
       }
 
-      if (vitalsReading.available)
-      {
-        builder.setVitals(
-            vitalsReading.heartRate,
-            vitalsReading.heartRateValid,
-            vitalsReading.spo2,
-            vitalsReading.spo2Valid);
-        if (vitalsReading.spo2Valid && vitalsReading.spo2 < 92)
-        {
-          builder.addAlert("SPO2_LOW", "SpO2=" + String(vitalsReading.spo2));
-        }
-      }
-
-      if (tempReading.available)
-      {
-        builder.setTemperature(tempReading.valueC, tempReading.status);
-        if (tempReading.status == "high")
-        {
-          builder.addAlert("TEMPERATURE_HIGH", "temp=" + String(tempReading.valueC, 2) + "C");
-        }
-      }
-
       if (client && client->isReady())
       {
         String payload = builder.build(nowMs);
@@ -901,35 +581,6 @@ void sensorTask(void *param)
       {
         Serial.print(fallReading.tiltDeg, 1);
         Serial.print("deg");
-      }
-      else
-      {
-        Serial.print("--");
-      }
-      Serial.print(" | HR=");
-      if (vitalsReading.available && vitalsReading.heartRateValid)
-      {
-        Serial.print(vitalsReading.heartRate);
-      }
-      else
-      {
-        Serial.print("--");
-      }
-      Serial.print(" bpm SpO2=");
-      if (vitalsReading.available && vitalsReading.spo2Valid)
-      {
-        Serial.print(vitalsReading.spo2);
-        Serial.print("%");
-      }
-      else
-      {
-        Serial.print("--");
-      }
-      Serial.print(" | Temp=");
-      if (tempReading.available && !isnan(tempReading.valueC))
-      {
-        Serial.print(tempReading.valueC, 2);
-        Serial.print("C");
       }
       else
       {

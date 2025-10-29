@@ -235,31 +235,17 @@
         }
         try {
           const fall = data.sensors?.fall;
-          const vitals = data.sensors?.vitals;
-          const temperature = data.sensors?.temperature;
 
           const chunks = [];
           if (fall) {
-            chunks.push(
-              `Fall: <strong>${fall.state ?? "?"}</strong>${fall.tiltDeg !== undefined ? ` @ ${fall.tiltDeg.toFixed(1)}°` : ""
-              }`
-            );
-          }
-          if (vitals) {
-            const hr = vitals.heartRateValid ? `${vitals.heartRate} bpm` : "—";
-            const spo2 = vitals.spo2Valid ? `${vitals.spo2}% SpO₂` : "—";
-            chunks.push(`Vitals: HR ${hr}, SpO₂ ${spo2}`);
-          }
-          if (temperature) {
-            const value = temperature.valueC ?? temperature.value;
-            if (value !== undefined) {
-              chunks.push(`Temperature: ${Number(value).toFixed(1)} °C`);
-            }
+            const tiltText =
+              typeof fall.tiltDeg === "number" ? ` @ ${fall.tiltDeg.toFixed(1)} deg` : "";
+            chunks.push(`Fall: <strong>${fall.state ?? "?"}</strong>${tiltText}`);
           }
           if (chunks.length === 0) {
             return "<span class='muted'>Telemetry received</span>";
           }
-          return chunks.join(" · ");
+          return chunks.join(" | ");
         } catch (_err) {
           return "<span class='muted'>Telemetry received</span>";
         }
